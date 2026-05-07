@@ -68,6 +68,7 @@ a = Analysis(
         *collect_data_files("fastmcp"),
         *collect_data_files("mcp"),
         *collect_data_files("fakeredis"),  # Required for commands.json used by fakeredis ACL
+        *collect_data_files("binaryornot"),  # Required for binary file detection data
         *get_fakeredis_data(),  # Ensure fakeredis/model/ directory structure exists
 
         # OpenHands SDK prompt templates (adjusted for shallow namespace layout)
