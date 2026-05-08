@@ -413,6 +413,10 @@ async def execute_tool(
     This is useful for pre-run setup operations like running setup scripts
     through the agent's terminal tool so environment changes persist in the
     agent's session.
+
+    **Security Note**: This endpoint bypasses the agent's security analyzer
+    and confirmation mode.  Ensure proper authentication and authorization
+    are enforced at the API gateway level.
     """
     try:
         result = await conversation_service.execute_tool(
