@@ -748,6 +748,50 @@ class LocalConversation(BaseConversation):
             )
             self._on_event(user_msg_event)
 
+    def _handle_stop_denial(
+        self,
+        consecutive_stop_denials: int,
+        events_count_at_last_deny: int,
+        feedback: str | None,
+    ) -> tuple[bool, int, int]:
+        if consecutive_stop_denials > 0:
+            recent_events = self._state.events[events_count_at_last_deny:]
+            if any(isinstance(e, ActionEvent) for e in recent_events):
+                consecutive_stop_denials = 0
+        consecutive_stop_denials += 1
+
+        if consecutive_stop_denials >= self.max_consecutive_stop_denials:
+            error_msg = (
+                f"Stop hook denied {consecutive_stop_denials}"
+                f" times without progress (limit "
+                f"{self.max_consecutive_stop_denials}). "
+                f"Last feedback: {feedback or '(none)'}"
+            )
+            logger.error(error_msg)
+            self._state.execution_status = ConversationExecutionStatus.ERROR
+            self._on_event(
+                ConversationErrorEvent(
+                    source="environment",
+                    code="StopHookLoopDetected",
+                    detail=error_msg,
+                )
+            )
+            return True, consecutive_stop_denials, events_count_at_last_deny
+
+        if feedback:
+            prefixed = f"[Stop hook feedback] {feedback}"
+            feedback_msg = MessageEvent(
+                source="environment",
+                llm_message=Message(
+                    role="user",
+                    content=[TextContent(text=prefixed)],
+                ),
+            )
+            self._on_event(feedback_msg)
+        events_count_at_last_deny = len(self._state.events)
+        self._state.execution_status = ConversationExecutionStatus.RUNNING
+        return False, consecutive_stop_denials, events_count_at_last_deny
+
     @observe(name="conversation.run")
     def run(self) -> None:
         """Runs the conversation until the agent finishes.
@@ -800,54 +844,17 @@ class LocalConversation(BaseConversation):
                             )
                             if not should_stop:
                                 logger.info("Stop hook denied agent stopping")
-                                if consecutive_stop_denials > 0:
-                                    recent_events = self._state.events[
-                                        events_count_at_last_deny:
-                                    ]
-                                    if any(
-                                        isinstance(e, ActionEvent)
-                                        for e in recent_events
-                                    ):
-                                        consecutive_stop_denials = 0
-                                consecutive_stop_denials += 1
-
-                                if (
-                                    consecutive_stop_denials
-                                    >= self.max_consecutive_stop_denials
-                                ):
-                                    error_msg = (
-                                        f"Stop hook denied {consecutive_stop_denials}"
-                                        f" times without progress (limit "
-                                        f"{self.max_consecutive_stop_denials}). "
-                                        f"Last feedback: {feedback or '(none)'}"
-                                    )
-                                    logger.error(error_msg)
-                                    self._state.execution_status = (
-                                        ConversationExecutionStatus.ERROR
-                                    )
-                                    self._on_event(
-                                        ConversationErrorEvent(
-                                            source="environment",
-                                            code="StopHookLoopDetected",
-                                            detail=error_msg,
-                                        )
-                                    )
-                                    break
-
-                                if feedback:
-                                    prefixed = f"[Stop hook feedback] {feedback}"
-                                    feedback_msg = MessageEvent(
-                                        source="environment",
-                                        llm_message=Message(
-                                            role="user",
-                                            content=[TextContent(text=prefixed)],
-                                        ),
-                                    )
-                                    self._on_event(feedback_msg)
-                                events_count_at_last_deny = len(self._state.events)
-                                self._state.execution_status = (
-                                    ConversationExecutionStatus.RUNNING
+                                (
+                                    should_break,
+                                    consecutive_stop_denials,
+                                    events_count_at_last_deny,
+                                ) = self._handle_stop_denial(
+                                    consecutive_stop_denials,
+                                    events_count_at_last_deny,
+                                    feedback,
                                 )
+                                if should_break:
+                                    break
                                 continue
                         # No hooks or hooks allowed stopping
                         break
