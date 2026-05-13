@@ -78,7 +78,9 @@ def extend_python_path(extra_paths: str | None) -> None:
 
     if added:
         logger.info(
-            "Extended sys.path with %d directory for custom tool imports", added
+            "Extended sys.path with %d director%s for custom tool imports",
+            added,
+            "y" if added == 1 else "ies",
         )
 
 
