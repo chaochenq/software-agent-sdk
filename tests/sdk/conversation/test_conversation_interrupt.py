@@ -1,7 +1,8 @@
 """Tests for conversation interrupt functionality."""
 
 import threading
-from unittest.mock import patch
+import uuid
+from unittest.mock import Mock, patch
 
 import pytest
 from pydantic import SecretStr
@@ -212,3 +213,93 @@ def test_conversation_interrupt_is_thread_safe(agent: Agent, tmp_path):
 
     # Should not raise any errors and status should be PAUSED
     assert conv.state.execution_status == ConversationExecutionStatus.PAUSED
+
+
+def test_interrupt_adds_event_to_state(agent: Agent, tmp_path):
+    """Test that interrupt() adds an InterruptEvent to state events."""
+    conv = LocalConversation(agent=agent, workspace=str(tmp_path))
+
+    conv.interrupt()
+
+    # Verify an InterruptEvent was added to the state events
+    interrupt_events = [e for e in conv.state.events if isinstance(e, InterruptEvent)]
+    assert len(interrupt_events) == 1
+    assert interrupt_events[0].source == "user"
+    assert interrupt_events[0].reason == "User requested interrupt"
+
+
+def test_interrupt_no_event_when_already_paused(agent: Agent, tmp_path):
+    """Test that interrupt doesn't add event when status is already PAUSED."""
+    conv = LocalConversation(agent=agent, workspace=str(tmp_path))
+
+    # Set to PAUSED (not IDLE or RUNNING)
+    conv._state.execution_status = ConversationExecutionStatus.PAUSED
+
+    conv.interrupt()
+
+    # No InterruptEvent should be added (status guard prevents it)
+    interrupt_events = [e for e in conv.state.events if isinstance(e, InterruptEvent)]
+    assert len(interrupt_events) == 0
+
+
+@patch("openhands.sdk.conversation.impl.remote_conversation.WebSocketCallbackClient")
+def test_remote_conversation_interrupt(mock_ws_client):
+    """Test that RemoteConversation.interrupt() sends correct HTTP request."""
+    from openhands.sdk.conversation.impl.remote_conversation import (
+        RemoteConversation,
+    )
+    from openhands.sdk.workspace import RemoteWorkspace
+
+    host = "http://localhost:8000"
+    llm = LLM(model="gpt-4o", api_key=SecretStr("test_key"), num_retries=0)
+    agent = Agent(llm=llm)
+    workspace = RemoteWorkspace(host=host, working_dir="/tmp")
+
+    conversation_id = str(uuid.uuid4())
+
+    # Set up mock client
+    mock_client = Mock()
+    workspace._client = mock_client
+
+    mock_conv_response = Mock()
+    mock_conv_response.status_code = 200
+    mock_conv_response.raise_for_status.return_value = None
+    mock_conv_response.json.return_value = {
+        "id": conversation_id,
+        "conversation_id": conversation_id,
+    }
+
+    mock_events_response = Mock()
+    mock_events_response.status_code = 200
+    mock_events_response.raise_for_status.return_value = None
+    mock_events_response.json.return_value = {
+        "items": [],
+        "next_page_id": None,
+    }
+
+    def request_side_effect(method, url, **kwargs):
+        if method == "POST" and url == "/api/conversations":
+            return mock_conv_response
+        if method == "GET" and "/events" in url:
+            return mock_events_response
+        # Default success
+        response = Mock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = {}
+        return response
+
+    mock_client.request.side_effect = request_side_effect
+    mock_ws_client.return_value = Mock()
+
+    conversation = RemoteConversation(agent=agent, workspace=workspace)
+    conversation.interrupt()
+
+    # Verify interrupt API call was made to the correct path
+    interrupt_calls = [
+        call
+        for call in mock_client.request.call_args_list
+        if call[0][0] == "POST"
+        and f"/api/conversations/{conversation_id}/interrupt" in call[0][1]
+    ]
+    assert len(interrupt_calls) == 1

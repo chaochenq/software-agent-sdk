@@ -971,13 +971,13 @@ class LocalConversation(BaseConversation):
         """
         from openhands.sdk.event.user_action import InterruptEvent
 
-        # Cancel all LLMs first (main agent LLM + any in registry)
-        self.agent.llm.cancel()
-        for llm in self.llm_registry.usage_to_llm.values():
-            llm.cancel()
-
-        # Set paused status
+        # Cancel all LLMs and update state atomically under the state lock.
+        # cancel() is non-blocking so holding the lock is safe.
         with self._state:
+            self.agent.llm.cancel()
+            for llm in self.llm_registry.usage_to_llm.values():
+                llm.cancel()
+
             if self._state.execution_status in [
                 ConversationExecutionStatus.IDLE,
                 ConversationExecutionStatus.RUNNING,

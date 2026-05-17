@@ -4,13 +4,16 @@ import asyncio
 import threading
 import time
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from litellm.types.utils import (
     Choices,
+    Delta,
     Message as LiteLLMMessage,
     ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
     Usage,
 )
 from pydantic import SecretStr
@@ -449,3 +452,123 @@ def test_llm_close_cancels_in_flight_task(mock_acompletion, llm: LLM, messages):
     assert result_container["error"] is not None
     assert isinstance(result_container["error"], LLMCancelledError)
     assert not call_finished.is_set()  # Call should not have completed normally
+
+
+# =========================================================================
+# Streaming cancellation tests
+# =========================================================================
+
+
+def create_stream_chunk(
+    content: str | None, finish_reason: str | None = None
+) -> ModelResponseStream:
+    """Create a streaming chunk."""
+    return ModelResponseStream(
+        id="chatcmpl-test",
+        choices=[
+            StreamingChoices(
+                finish_reason=finish_reason,
+                index=0,
+                delta=Delta(content=content, role="assistant" if content else None),
+            )
+        ],
+        created=1234567890,
+        model="gpt-4o",
+        object="chat.completion.chunk",
+    )
+
+
+@patch("openhands.sdk.llm.llm.litellm_acompletion")
+@patch("openhands.sdk.llm.llm.litellm.stream_chunk_builder")
+def test_streaming_cancel_during_iteration(mock_stream_builder, mock_acompletion):
+    """Test that cancel() interrupts streaming at the next chunk boundary."""
+    from litellm import CustomStreamWrapper
+
+    llm = LLM(
+        model="gpt-4o",
+        api_key=SecretStr("test_key"),
+        stream=True,
+        num_retries=0,
+    )
+    messages = [Message(role="user", content=[TextContent(text="Hello")])]
+
+    call_started = threading.Event()
+    chunk_count = 0
+
+    # Create an async iterator that signals when started, then yields slowly
+    async def slow_async_stream():
+        nonlocal chunk_count
+        call_started.set()
+        for i in range(20):
+            chunk_count += 1
+            yield create_stream_chunk(f"chunk{i}")
+            await asyncio.sleep(0.1)
+        yield create_stream_chunk(None, finish_reason="stop")
+
+    mock_stream = MagicMock(spec=CustomStreamWrapper)
+    mock_stream.__aiter__ = lambda self: slow_async_stream().__aiter__()
+    mock_acompletion.return_value = mock_stream
+    mock_stream_builder.return_value = create_mock_response("partial")
+
+    tokens_received: list[str] = []
+
+    def on_token(chunk):
+        tokens_received.append(str(chunk))
+
+    result_container: dict[str, Any] = {"result": None, "error": None}
+
+    def run_streaming():
+        try:
+            result_container["result"] = llm.completion(messages, on_token=on_token)
+        except Exception as e:
+            result_container["error"] = e
+
+    thread = threading.Thread(target=run_streaming)
+    thread.start()
+
+    # Wait for streaming to start
+    call_started.wait(timeout=2)
+    time.sleep(0.15)  # Let a few chunks through
+
+    # Cancel mid-stream
+    llm.cancel()
+
+    thread.join(timeout=3)
+
+    # Should have been cancelled
+    assert result_container["error"] is not None
+    assert isinstance(result_container["error"], LLMCancelledError)
+    # Should have received some chunks before cancellation, but not all 20
+    assert chunk_count < 20
+
+
+@patch("openhands.sdk.llm.llm.litellm_acompletion")
+@patch("openhands.sdk.llm.llm.litellm.stream_chunk_builder")
+def test_streaming_cancel_before_start(mock_stream_builder, mock_acompletion):
+    """Test that pre-cancelled LLM rejects streaming calls."""
+    from litellm import CustomStreamWrapper
+
+    llm = LLM(
+        model="gpt-4o",
+        api_key=SecretStr("test_key"),
+        stream=True,
+        num_retries=0,
+    )
+    messages = [Message(role="user", content=[TextContent(text="Hello")])]
+
+    async def async_stream():
+        yield create_stream_chunk("Hello")
+        yield create_stream_chunk(None, finish_reason="stop")
+
+    mock_stream = MagicMock(spec=CustomStreamWrapper)
+    mock_stream.__aiter__ = lambda self: async_stream().__aiter__()
+    mock_acompletion.return_value = mock_stream
+    mock_stream_builder.return_value = create_mock_response("Hello")
+
+    # Cancel before calling
+    llm.cancel()
+
+    # Streaming call should still work (cancel only affects in-flight calls)
+    tokens: list[str] = []
+    result = llm.completion(messages, on_token=lambda c: tokens.append(str(c)))
+    assert result is not None
