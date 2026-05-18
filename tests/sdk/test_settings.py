@@ -7,8 +7,11 @@ from pydantic import SecretStr
 
 from openhands.agent_server.models import StartConversationRequest
 from openhands.sdk import (
+    ACP_CODEX_SUBSCRIPTION_AUTH_SECRET,
+    ACP_GEMINI_CLI_SUBSCRIPTION_AUTH_SECRET,
     LLM,
     ACPAgentSettings,
+    ACPFileSecretSpec,
     Agent,
     AgentContext,
     AgentSettings,
@@ -137,6 +140,7 @@ def test_acp_agent_settings_export_schema_has_acp_section() -> None:
         "acp_command",
         "acp_args",
         "acp_env",
+        "acp_file_secrets",
         "acp_model",
         "acp_session_mode",
         "acp_prompt_timeout",
@@ -146,6 +150,14 @@ def test_acp_agent_settings_export_schema_has_acp_section() -> None:
     assert acp_fields["acp_server"].prominence is SettingProminence.CRITICAL
     assert acp_fields["acp_model"].prominence is SettingProminence.CRITICAL
     assert acp_fields["acp_command"].prominence is SettingProminence.MINOR
+
+
+def test_acp_subscription_auth_secret_infos_are_exported_package_level() -> None:
+    assert ACP_CODEX_SUBSCRIPTION_AUTH_SECRET.secret_name == "CODEX_AUTH_JSON"
+    assert (
+        ACP_GEMINI_CLI_SUBSCRIPTION_AUTH_SECRET.secret_name
+        == "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+    )
 
 
 def test_conversation_settings_export_schema_groups_sections() -> None:
@@ -634,6 +646,35 @@ def test_acp_resolve_provider_env_custom_server_empty() -> None:
     assert settings.resolve_provider_env() == {}
 
 
+def test_acp_resolve_file_secrets_from_known_provider_defaults() -> None:
+    codex = ACPAgentSettings(acp_server="codex")
+    codex_specs = codex.resolve_acp_file_secrets()
+    assert [spec.secret_name for spec in codex_specs] == ["CODEX_AUTH_JSON"]
+    assert codex_specs[0].env == {"CODEX_HOME": "{dir}"}
+
+    gemini = ACPAgentSettings(acp_server="gemini-cli")
+    gemini_specs = gemini.resolve_acp_file_secrets()
+    assert [spec.secret_name for spec in gemini_specs] == [
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+    ]
+    assert gemini_specs[0].env == {"GOOGLE_APPLICATION_CREDENTIALS": "{file}"}
+
+
+def test_acp_resolve_file_secrets_custom_server_uses_custom_specs_only() -> None:
+    spec = ACPFileSecretSpec(
+        secret_name="CUSTOM_AUTH_JSON",
+        relative_path="auth.json",
+        env={"CUSTOM_AUTH_FILE": "{file}"},
+    )
+    settings = ACPAgentSettings(
+        acp_server="custom",
+        acp_command=["custom-acp"],
+        acp_file_secrets=[spec],
+    )
+
+    assert settings.resolve_acp_file_secrets() == [spec]
+
+
 def test_acp_resolve_acp_env_explicit_entries_override_provider_env() -> None:
     settings = ACPAgentSettings(
         acp_server="claude-code",
@@ -655,7 +696,25 @@ def test_acp_create_agent_passes_resolved_env_and_agent_context() -> None:
     agent = settings.create_agent()
 
     assert agent.acp_env == {"OPENAI_API_KEY": "sk-openai"}
+    assert [spec.secret_name for spec in agent.acp_file_secrets] == ["CODEX_AUTH_JSON"]
     assert agent.agent_context == context
+
+
+def test_acp_create_agent_passes_custom_file_secrets() -> None:
+    spec = ACPFileSecretSpec(
+        secret_name="CUSTOM_AUTH_JSON",
+        relative_path="auth.json",
+        env={"CUSTOM_AUTH_FILE": "{file}"},
+    )
+    settings = ACPAgentSettings(
+        acp_server="custom",
+        acp_command=["custom-acp"],
+        acp_file_secrets=[spec],
+    )
+
+    agent = settings.create_agent()
+
+    assert agent.acp_file_secrets == [spec]
 
 
 # ---------------------------------------------------------------------------

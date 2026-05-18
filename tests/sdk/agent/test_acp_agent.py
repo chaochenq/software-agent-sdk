@@ -35,6 +35,7 @@ from openhands.sdk.event import (
     SystemPromptEvent,
 )
 from openhands.sdk.llm import ImageContent, Message, TextContent
+from openhands.sdk.settings import ACP_PROVIDERS, ACPFileSecretSpec
 from openhands.sdk.skills import KeywordTrigger, Skill
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
@@ -48,6 +49,14 @@ from openhands.sdk.workspace.local import LocalWorkspace
 
 def _make_agent(**kwargs) -> ACPAgent:
     return ACPAgent(acp_command=["echo", "test"], **kwargs)
+
+
+def _file_secret_specs_for(*provider_keys: str) -> list[ACPFileSecretSpec]:
+    return [
+        spec
+        for provider_key in provider_keys
+        for spec in ACP_PROVIDERS[provider_key].file_secrets
+    ]
 
 
 def _make_state(tmp_path) -> ConversationState:
@@ -2737,6 +2746,16 @@ class TestSelectAuthMethod:
         with patch("openhands.sdk.agent.acp_agent.Path.home", return_value=tmp_path):
             assert _select_auth_method(methods, {}) == "chatgpt"
 
+    def test_chatgpt_auth_file_from_codex_home_env(self, tmp_path):
+        methods = [self._make_auth_method("chatgpt")]
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+
+        assert _select_auth_method(methods, {"CODEX_HOME": str(codex_home)}) == (
+            "chatgpt"
+        )
+
     def test_empty_auth_methods(self):
         assert _select_auth_method([], {}) is None
 
@@ -3574,7 +3593,9 @@ class TestACPSecretsEnvInjection:
         return conn
 
     @staticmethod
-    def _run_start_capturing_env(agent, tmp_path) -> dict:
+    def _run_start_capturing_env(
+        agent, tmp_path, capture_args: list[str] | None = None
+    ) -> dict:
         """Run _start_acp_server and return the env dict passed to the subprocess."""
         from contextlib import ExitStack
 
@@ -3588,6 +3609,8 @@ class TestACPSecretsEnvInjection:
         mock_process.stdout = MagicMock()
 
         async def _fake_create_subprocess_exec(*_args, env=None, **_kwargs):
+            if capture_args is not None:
+                capture_args[:] = [str(arg) for arg in _args]
             captured.update(env or {})
             return mock_process
 
@@ -3688,19 +3711,27 @@ class TestACPSecretsEnvInjection:
 
 
 class TestACPFileSecretMaterialisation:
-    """Reserved secret names get written to disk before the subprocess spawns.
+    """Configured secret names get written to disk before the subprocess spawns.
 
     Some ACP servers authenticate via a JSON credential file rather than an
-    env var. When ``agent_context.secrets`` contains one of the reserved
-    names in :data:`_FILE_SECRETS`, the SDK must write the payload to a
+    env var. When ``agent_context.secrets`` contains one of the configured
+    names in ``acp_file_secrets``, the SDK must write the payload to a
     per-agent tempdir, set the corresponding env var on the subprocess, and
     drop the secret from the regular env-var injection path so its
     (potentially large) payload is not leaked into ``os.environ``.
     """
 
     @staticmethod
-    def _run_start_capturing_env(agent, tmp_path) -> dict:
-        return TestACPSecretsEnvInjection._run_start_capturing_env(agent, tmp_path)
+    def _run_start_capturing_env(
+        agent,
+        tmp_path,
+        capture_args: list[str] | None = None,
+    ) -> dict:
+        return TestACPSecretsEnvInjection._run_start_capturing_env(
+            agent,
+            tmp_path,
+            capture_args=capture_args,
+        )
 
     def test_codex_auth_json_materialised_with_codex_home(self, tmp_path):
         """CODEX_AUTH_JSON → auth.json on disk + CODEX_HOME=<dir>."""
@@ -3710,9 +3741,10 @@ class TestACPFileSecretMaterialisation:
 
         payload = '{"auth_mode":"chatgpt","tokens":{"id_token":"tok"}}'
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex"),
             agent_context=AgentContext(
                 secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr(payload))}
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
@@ -3732,13 +3764,14 @@ class TestACPFileSecretMaterialisation:
 
         payload = '{"type":"service_account","project_id":"p","client_email":"x@y"}'
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("gemini-cli"),
             agent_context=AgentContext(
                 secrets={
                     "GOOGLE_APPLICATION_CREDENTIALS_JSON": StaticSecret(
                         value=SecretStr(payload)
                     )
                 }
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
@@ -3749,6 +3782,95 @@ class TestACPFileSecretMaterialisation:
         assert gac_path.read_text() == payload
         assert "GOOGLE_APPLICATION_CREDENTIALS_JSON" not in env
 
+    def test_custom_file_secret_materialises_env_and_args(self, tmp_path):
+        """Custom ACP servers can declare their own file-secret convention."""
+        from pydantic import SecretStr
+
+        from openhands.sdk.secret import StaticSecret
+
+        payload = '{"token":"custom"}'
+        launch_args: list[str] = []
+        agent = ACPAgent(
+            acp_command=["custom-acp"],
+            acp_args=["--existing"],
+            acp_file_secrets=[
+                ACPFileSecretSpec(
+                    secret_name="CUSTOM_AUTH_JSON",
+                    relative_path="nested/config.json",
+                    env={
+                        "CUSTOM_AUTH_FILE": "{file}",
+                        "CUSTOM_AUTH_DIR": "{dir}",
+                        "CUSTOM_AUTH_ROOT": "{root}",
+                    },
+                    args=["--config", "{file}"],
+                )
+            ],
+            agent_context=AgentContext(
+                secrets={"CUSTOM_AUTH_JSON": StaticSecret(value=SecretStr(payload))}
+            ),
+        )
+        env = self._run_start_capturing_env(
+            agent,
+            tmp_path,
+            capture_args=launch_args,
+        )
+
+        auth_file = Path(env["CUSTOM_AUTH_FILE"])
+        auth_dir = Path(env["CUSTOM_AUTH_DIR"])
+        auth_root = Path(env["CUSTOM_AUTH_ROOT"])
+        assert auth_file.is_file()
+        assert auth_file.read_text() == payload
+        assert auth_file == auth_dir / "nested" / "config.json"
+        assert auth_dir.parent == auth_root
+        assert "CUSTOM_AUTH_JSON" not in env
+        assert launch_args == [
+            "custom-acp",
+            "--existing",
+            "--config",
+            str(auth_file),
+        ]
+
+    def test_secret_with_no_file_secret_spec_flows_through_env(self, tmp_path):
+        """There is no global Codex/Gemini magic for custom ACP commands."""
+        from pydantic import SecretStr
+
+        from openhands.sdk.secret import StaticSecret
+
+        agent = _make_agent(
+            acp_file_secrets=[],
+            agent_context=AgentContext(
+                secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr("{}"))}
+            ),
+        )
+        env = self._run_start_capturing_env(agent, tmp_path)
+
+        assert "CODEX_HOME" not in env
+        assert env["CODEX_AUTH_JSON"] == "{}"
+
+    def test_file_secret_env_collision_can_raise(self, tmp_path):
+        """Specs can opt out of replacing an existing env var."""
+        from pydantic import SecretStr
+
+        from openhands.sdk.secret import StaticSecret
+
+        agent = _make_agent(
+            acp_env={"CUSTOM_AUTH_FILE": "/already/set.json"},
+            acp_file_secrets=[
+                ACPFileSecretSpec(
+                    secret_name="CUSTOM_AUTH_JSON",
+                    relative_path="config.json",
+                    env={"CUSTOM_AUTH_FILE": "{file}"},
+                    overwrite_env=False,
+                )
+            ],
+            agent_context=AgentContext(
+                secrets={"CUSTOM_AUTH_JSON": StaticSecret(value=SecretStr("{}"))}
+            ),
+        )
+
+        with pytest.raises(ValueError, match="would overwrite"):
+            self._run_start_capturing_env(agent, tmp_path)
+
     def test_materialised_file_is_readable_only_by_owner(self, tmp_path):
         """File-secret payloads on disk must be 0o600."""
         import stat as stat_mod
@@ -3758,9 +3880,10 @@ class TestACPFileSecretMaterialisation:
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex"),
             agent_context=AgentContext(
                 secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr("{}"))}
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
         auth_path = Path(env["CODEX_HOME"]) / "auth.json"
@@ -3774,12 +3897,13 @@ class TestACPFileSecretMaterialisation:
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex"),
             agent_context=AgentContext(
                 secrets={
                     "CODEX_AUTH_JSON": StaticSecret(value=SecretStr("{}")),
                     "GITHUB_TOKEN": StaticSecret(value=SecretStr("ghp_xyz")),
                 }
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
         # File-secret was materialised
@@ -3794,9 +3918,10 @@ class TestACPFileSecretMaterialisation:
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex"),
             agent_context=AgentContext(
                 secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr(""))}
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
         assert "CODEX_HOME" not in env
@@ -3809,6 +3934,7 @@ class TestACPFileSecretMaterialisation:
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex", "gemini-cli"),
             agent_context=AgentContext(
                 secrets={
                     "CODEX_AUTH_JSON": StaticSecret(value=SecretStr("{}")),
@@ -3816,7 +3942,7 @@ class TestACPFileSecretMaterialisation:
                         value=SecretStr('{"type":"service_account"}')
                     ),
                 }
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
         codex_dir = Path(env["CODEX_HOME"]).resolve()
@@ -3833,9 +3959,10 @@ class TestACPFileSecretMaterialisation:
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
+            acp_file_secrets=_file_secret_specs_for("codex"),
             agent_context=AgentContext(
                 secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr("{}"))}
-            )
+            ),
         )
         env = self._run_start_capturing_env(agent, tmp_path)
         codex_home = Path(env["CODEX_HOME"])
