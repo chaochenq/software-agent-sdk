@@ -9,6 +9,7 @@ from openhands.sdk.tool.tool import (
     Observation,
 )
 
+
 CommandLiteral = Literal["spawn", "delegate"]
 
 

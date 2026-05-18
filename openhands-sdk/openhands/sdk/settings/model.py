@@ -1333,6 +1333,7 @@ def validate_agent_settings(
     )
     return _AGENT_SETTINGS_ADAPTER.validate_python(payload, context=context)
 
+
 def default_agent_settings() -> OpenHandsAgentSettings:
     """Return a default :class:`OpenHandsAgentSettings` instance.
 
