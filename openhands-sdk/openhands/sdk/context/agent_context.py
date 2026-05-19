@@ -119,20 +119,24 @@ class AgentContext(BaseModel):
         json_schema_extra={"acp_compatible": True},
     )
 
-    # Names of skills that ``_load_auto_skills`` added on top of the
-    # caller-supplied list. Tracked so the serializer can drop them from
-    # the wire payload: the same auto-load will re-run on the next
-    # deserialization (this model_validator runs in ``mode="after"``), so
-    # persisting them is pure duplication. For a stock configuration that
-    # turns both flags on (~40 skills bundled under
+    # Snapshot of the skills that ``_load_auto_skills`` added on top of
+    # the caller-supplied list. The serializer drops only the ones still
+    # equal to this snapshot — if a downstream consumer replaces an
+    # auto-loaded skill via ``model_copy(update={'skills': merged})``
+    # (OpenHands' ``_create_agent_with_skills`` does this when it merges
+    # in sandbox / repo skills with overlapping names), the replacement
+    # has different field values and survives serialization. The same
+    # auto-load will re-run on the receiving end and rebuild the
+    # auto-loaded subset that wasn't replaced. For a stock configuration
+    # that turns both flags on (~40 skills bundled under
     # ``~/.openhands/skills``) the resolved list is ~260 KB per
-    # ``AgentContext`` instance — every ``GET`` on a stored conversation
-    # carried that. See software-agent-sdk#3301.
-    _auto_loaded_skill_names: set[str] = PrivateAttr(default_factory=set)
+    # ``AgentContext`` — every ``GET`` on a stored conversation carried
+    # that. See software-agent-sdk#3301.
+    _auto_loaded_skills: dict[str, Skill] = PrivateAttr(default_factory=dict)
 
     @field_serializer("skills", when_used="always")
     def _serialize_skills(self, value: list[Skill], info) -> list[Any]:
-        """Drop auto-loaded skills from the serialized output.
+        """Drop unmodified auto-loaded skills from the serialized output.
 
         The runtime keeps the full resolved list on ``self.skills`` so
         prompt rendering and downstream consumers behave exactly as
@@ -141,9 +145,16 @@ class AgentContext(BaseModel):
         the auto-loaded subset deterministically from the same
         ``load_user_skills`` / ``load_public_skills`` /
         ``marketplace_path`` configuration.
+
+        Equality (not just name match) is required because consumers
+        like OpenHands' ``_create_agent_with_skills`` replace
+        auto-loaded skills in-place with their own version under the
+        same name. A name-only filter would silently drop those
+        replacements and the receiver would auto-reload the stock
+        version on the next deserialization.
         """
-        auto_names = self._auto_loaded_skill_names
-        kept = [s for s in value if s.name not in auto_names]
+        auto = self._auto_loaded_skills
+        kept = [s for s in value if auto.get(s.name) != s]
         return [s.model_dump(mode=info.mode, context=info.context) for s in kept]
 
     @field_serializer("secrets", when_used="always")
@@ -211,11 +222,11 @@ class AgentContext(BaseModel):
             existing = existing_by_name.get(name)
             if existing is None:
                 self.skills.append(skill)
-                self._auto_loaded_skill_names.add(name)
+                self._auto_loaded_skills[name] = skill
             elif existing == skill:
                 # Migration path for conversations stored before the
                 # serializer change — see the docstring.
-                self._auto_loaded_skill_names.add(name)
+                self._auto_loaded_skills[name] = skill
             else:
                 logger.debug(
                     f"Skipping auto-loaded skill '{name}' (already in explicit skills)"

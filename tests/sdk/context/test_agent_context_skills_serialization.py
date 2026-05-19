@@ -165,6 +165,43 @@ class TestAutoLoadedSkillsSerialization:
         assert len(dumped["skills"]) == 1
         assert dumped["skills"][0]["content"] == "old persisted content"
 
+    def test_replacing_auto_skill_via_model_copy_survives_serialization(self):
+        """Regression guard for OpenHands' ``_create_agent_with_skills`` flow.
+
+        That helper does ``agent_context.model_copy(update={'skills':
+        merged})`` where ``merged`` is the result of deduping
+        auto-loaded + sandbox/repo-loaded skills by name, with the
+        later list winning. If two lists carry the same name, the
+        merged result is the *replacement* — different content from
+        what ``_load_auto_skills`` produced.
+
+        A name-only serializer would drop the replacement (the name
+        matches an auto-loaded one) and the receiver would auto-load
+        the original stock version, silently dropping OpenHands'
+        customisations. The equality-based filter must keep the
+        replacement on the wire.
+        """
+        # Stock auto-loaded skill ("public version").
+        with patch(
+            "openhands.sdk.context.agent_context.load_available_skills",
+            return_value={"git-skill": _make_skill("git-skill", "public version")},
+        ):
+            ctx = AgentContext(load_public_skills=True)
+        # OpenHands merges in a different "git-skill" (same name).
+        replacement = _make_skill("git-skill", "OpenHands custom version")
+        # Drop the auto-loaded skill, add the replacement. This is what
+        # ``_merge_skills`` produces — later list (replacement) wins.
+        merged = [s for s in ctx.skills if s.name != "git-skill"] + [replacement]
+        new_ctx = ctx.model_copy(update={"skills": merged})
+
+        # In-memory: only the replacement is present.
+        assert len(new_ctx.skills) == 1
+        assert new_ctx.skills[0].content == "OpenHands custom version"
+        # On the wire: replacement survives (equality check, not name).
+        dumped = new_ctx.model_dump()
+        assert len(dumped["skills"]) == 1
+        assert dumped["skills"][0]["content"] == "OpenHands custom version"
+
     def test_payload_shrinks_to_explicit_only(self):
         """Concrete byte-count assertion: a 40-skill auto-load with a single
         explicit skill should serialize approximately the size of the
