@@ -183,6 +183,17 @@ class AgentContext(BaseModel):
         from the wire payload (this validator re-runs on every model
         load, so the same skills repopulate without needing to be
         persisted).
+
+        Migration: stored conversations created before the serializer
+        change carry the resolved auto-loaded skill list inlined on
+        ``skills``. When such a conversation is loaded back, the names
+        match ``existing_names`` and the new-append branch is skipped
+        — but we still mark them as auto-loaded if the persisted skill
+        equals what the loader would produce now. Without this, every
+        old conversation would keep the bloated payload until rewritten.
+        A persisted skill that no longer matches the loader's current
+        output (user edited the file, marketplace updated, etc.) stays
+        treated as explicit so the on-disk content wins.
         """
         if not self.load_user_skills and not self.load_public_skills:
             return self
@@ -195,10 +206,15 @@ class AgentContext(BaseModel):
             marketplace_path=self.marketplace_path,
         )
 
-        existing_names = {skill.name for skill in self.skills}
+        existing_by_name = {skill.name: skill for skill in self.skills}
         for name, skill in auto_skills.items():
-            if name not in existing_names:
+            existing = existing_by_name.get(name)
+            if existing is None:
                 self.skills.append(skill)
+                self._auto_loaded_skill_names.add(name)
+            elif existing == skill:
+                # Migration path for conversations stored before the
+                # serializer change — see the docstring.
                 self._auto_loaded_skill_names.add(name)
             else:
                 logger.debug(

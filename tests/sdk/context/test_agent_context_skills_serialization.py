@@ -115,6 +115,56 @@ class TestAutoLoadedSkillsSerialization:
         dumped = ctx.model_dump()
         assert {s["name"] for s in dumped["skills"]} == {"foo", "bar"}
 
+    def test_migration_stored_skills_matching_loader_are_marked_auto_loaded(self):
+        """Migration path: a conversation stored before this PR carries the
+        resolved auto-loaded skills inlined on ``skills``. On reload, the
+        validator must recognise those as auto-loaded (the persisted
+        skill equals what the loader produces) and drop them from the
+        next serialization — otherwise the bloat persists until the
+        conversation is recreated.
+        """
+        stored = [_make_skill("auto-x"), _make_skill("auto-y")]
+        # Loader returns the same skill objects (matches what was
+        # persisted under the old SDK).
+        loader_output = {
+            "auto-x": _make_skill("auto-x"),
+            "auto-y": _make_skill("auto-y"),
+        }
+        with patch(
+            "openhands.sdk.context.agent_context.load_available_skills",
+            return_value=loader_output,
+        ):
+            ctx = AgentContext(load_public_skills=True, skills=stored)
+
+        # No duplicates: skills stayed at 2 (migration recognised them).
+        assert {s.name for s in ctx.skills} == {"auto-x", "auto-y"}
+        # And the serialized payload drops them.
+        dumped = ctx.model_dump()
+        assert dumped["skills"] == []
+
+    def test_migration_stored_skills_diverged_from_loader_stay_explicit(self):
+        """If the persisted skill content no longer matches what the
+        loader would produce (user edited the file, marketplace updated),
+        the on-disk version wins — treat it as explicit and keep it on
+        the wire. This is the safe default: we don't drop content
+        someone may have intentionally customised.
+        """
+        stored = [_make_skill("auto-x", "old persisted content")]
+        loader_output = {"auto-x": _make_skill("auto-x", "new loader content")}
+        with patch(
+            "openhands.sdk.context.agent_context.load_available_skills",
+            return_value=loader_output,
+        ):
+            ctx = AgentContext(load_public_skills=True, skills=stored)
+
+        # The stored ("old") version wins in-memory.
+        assert len(ctx.skills) == 1
+        assert ctx.skills[0].content == "old persisted content"
+        # And it stays on the wire — not treated as auto-loaded.
+        dumped = ctx.model_dump()
+        assert len(dumped["skills"]) == 1
+        assert dumped["skills"][0]["content"] == "old persisted content"
+
     def test_payload_shrinks_to_explicit_only(self):
         """Concrete byte-count assertion: a 40-skill auto-load with a single
         explicit skill should serialize approximately the size of the
