@@ -386,14 +386,15 @@ class LocalConversation(BaseConversation):
                 tags=tags,
             )
 
-            # Deep-copy events from source → fork so the source stays
-            # immutable. Use `append_event` so the fork's cached view is
-            # built up incrementally alongside the event log, then call
-            # `rebuild_view` once at the end to run a full enforcement pass
-            # over the freshly-populated log (same posture as cold load).
+            # Deep-copy events from source → fork. Suppress the on_append
+            # callback during the bulk copy: rebuild_view() at the end will
+            # derive the view from scratch, so paying n incremental view
+            # updates only to discard them is pure overhead.
+            fork_conv._state._events.set_on_append(None)
             for event in self._state.events:
-                fork_conv._state.append_event(event.model_copy(deep=True))
+                fork_conv._state._events.append(event.model_copy(deep=True))
             fork_conv._state.rebuild_view()
+            fork_conv._state._wire_view_sync()
 
             # Copy runtime state that accumulated during the source
             # conversation. activated_knowledge_skills is list[str] – strings
@@ -881,16 +882,20 @@ class LocalConversation(BaseConversation):
                         )
                         break
         except Exception as e:
-            self._state.execution_status = ConversationExecutionStatus.ERROR
+            # Hold the state lock while mutating execution_status and
+            # emitting the error event so the view update in _on_event
+            # cannot race with a concurrent send_message()/run().
+            with self._state:
+                self._state.execution_status = ConversationExecutionStatus.ERROR
 
-            # Add an error event
-            self._on_event(
-                ConversationErrorEvent(
-                    source="environment",
-                    code=e.__class__.__name__,
-                    detail=str(e),
+                # Add an error event
+                self._on_event(
+                    ConversationErrorEvent(
+                        source="environment",
+                        code=e.__class__.__name__,
+                        detail=str(e),
+                    )
                 )
-            )
 
             # Re-raise with conversation id and persistence dir for better UX
             raise ConversationRunError(

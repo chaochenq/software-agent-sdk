@@ -68,6 +68,14 @@ class EventLog(EventsListBase):
         ``synced_count`` is the number of additional events that were
         synced from disk inside this append (non-zero only when another
         process wrote while this process was alive).
+
+        The callback is invoked inside the ``EventLog`` file lock, so
+        concurrent appends always execute their callbacks in the same
+        order as their writes. However, if the callback mutates shared
+        in-memory state (e.g. a cached ``View``), callers must still
+        hold an appropriate application-level lock (such as the
+        ``ConversationState`` lock) to prevent races with non-append
+        readers or writers on that shared state.
         """
         self._on_append = on_append
 
@@ -141,10 +149,10 @@ class EventLog(EventsListBase):
         evt_id = event.id
 
         try:
-            synced_count = 0
             with self._fs.lock(self._lock_path, timeout=LOCK_TIMEOUT_SECONDS):
                 # Sync with disk in case another process wrote while we waited
                 disk_length = self._count_events_on_disk()
+                synced_count = 0
                 if disk_length > self._length:
                     synced_count = disk_length - self._length
                     self._sync_from_disk(disk_length)
@@ -167,8 +175,11 @@ class EventLog(EventsListBase):
                 self._id_to_idx[evt_id] = self._length
                 self._length += 1
 
-            if self._on_append is not None:
-                self._on_append(event, synced_count)
+                # Fire the callback inside the file lock so that concurrent
+                # appends execute their callbacks in the same order as their
+                # writes, preventing view divergence from the persisted log.
+                if self._on_append is not None:
+                    self._on_append(event, synced_count)
         except TimeoutError:
             logger.error(
                 f"Failed to acquire EventLog lock within {LOCK_TIMEOUT_SECONDS}s "

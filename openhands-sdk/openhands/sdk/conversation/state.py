@@ -296,6 +296,15 @@ class ConversationState(OpenHandsModel):
         ``EventLog.append`` — whether via ``self.append_event`` or a
         direct ``self.events.append`` — will automatically update the
         cached ``_view``.
+
+        Thread-safety note: the callback executes inside the ``EventLog``
+        file lock, which serializes writes.  Callers of
+        ``EventLog.append`` must additionally hold the
+        ``ConversationState`` lock (``with self._state:``) to prevent
+        races between the ``_view`` mutation here and non-append readers
+        or writers.  All production call sites in ``LocalConversation``
+        satisfy this — see ``_default_callback``, ``fork``, and
+        ``condense``.
         """
 
         def _sync(event: Event, synced_count: int) -> None:
