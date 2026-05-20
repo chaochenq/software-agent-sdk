@@ -40,6 +40,7 @@ class EventLog(EventsListBase):
     _length: int
     _lock_path: str
     _write_guard: Callable[[], AbstractContextManager[None]] | None
+    _on_append: Callable[[Event, int], None] | None
 
     def __init__(self, fs: FileStore, dir_path: str = EVENTS_DIR) -> None:
         self._fs = fs
@@ -48,6 +49,7 @@ class EventLog(EventsListBase):
         self._idx_to_id: dict[int, EventID] = {}
         self._lock_path = f"{dir_path}/{LOCK_FILE_NAME}"
         self._write_guard = None
+        self._on_append = None
         self._length = self._scan_and_build_index()
 
     def set_write_guard(
@@ -55,6 +57,19 @@ class EventLog(EventsListBase):
         write_guard: Callable[[], AbstractContextManager[None]] | None,
     ) -> None:
         self._write_guard = write_guard
+
+    def set_on_append(
+        self,
+        on_append: Callable[[Event, int], None] | None,
+    ) -> None:
+        """Set a callback invoked after every successful ``append``.
+
+        The callback receives ``(event, synced_count)`` where
+        ``synced_count`` is the number of additional events that were
+        synced from disk inside this append (non-zero only when another
+        process wrote while this process was alive).
+        """
+        self._on_append = on_append
 
     def get_index(self, event_id: EventID) -> int:
         """Return the integer index for a given event_id."""
@@ -126,10 +141,12 @@ class EventLog(EventsListBase):
         evt_id = event.id
 
         try:
+            synced_count = 0
             with self._fs.lock(self._lock_path, timeout=LOCK_TIMEOUT_SECONDS):
                 # Sync with disk in case another process wrote while we waited
                 disk_length = self._count_events_on_disk()
                 if disk_length > self._length:
+                    synced_count = disk_length - self._length
                     self._sync_from_disk(disk_length)
 
                 if evt_id in self._id_to_idx:
@@ -149,6 +166,9 @@ class EventLog(EventsListBase):
                 self._idx_to_id[self._length] = evt_id
                 self._id_to_idx[evt_id] = self._length
                 self._length += 1
+
+            if self._on_append is not None:
+                self._on_append(event, synced_count)
         except TimeoutError:
             logger.error(
                 f"Failed to acquire EventLog lock within {LOCK_TIMEOUT_SECONDS}s "

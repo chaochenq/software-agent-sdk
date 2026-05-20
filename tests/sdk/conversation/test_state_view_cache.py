@@ -44,6 +44,7 @@ def state() -> ConversationState:
     )
     state._fs = InMemoryFileStore()
     state._events = EventLog(state._fs)
+    state._wire_view_sync()
     return state
 
 
@@ -164,3 +165,50 @@ def test_rebuild_view_replaces_cached_instance(state: ConversationState) -> None
 
     assert before is not after
     assert [e.id for e in after.events] == [e.id for e in before.events]
+
+
+def test_direct_eventlog_append_also_updates_view(
+    state: ConversationState,
+) -> None:
+    """Appending directly via state.events.append must still update the view.
+
+    This verifies the on_append callback wired by _wire_view_sync, so
+    callers who bypass state.append_event do not silently diverge the
+    cached view.
+    """
+    msg = message_event("direct")
+    state.events.append(msg)
+
+    assert len(state.view) == 1
+    assert state.view.events[0] is msg
+
+
+def test_view_rebuilds_when_eventlog_syncs_extra_events(
+    state: ConversationState,
+) -> None:
+    """If EventLog reports synced_count > 0, the view must be rebuilt.
+
+    We simulate this by writing an event file directly to the in-memory
+    file store so that EventLog._sync_from_disk picks it up during the
+    next append.
+    """
+    from openhands.sdk.conversation.persistence_const import EVENT_FILE_PATTERN
+
+    # Manually insert an event file behind EventLog's back, simulating
+    # another process having written while this state was alive.
+    sneaky_msg = message_event("sneaky")
+    payload = sneaky_msg.model_dump_json(exclude_none=True)
+    path = f"events/{EVENT_FILE_PATTERN.format(idx=0, event_id=sneaky_msg.id)}"
+    state._fs.write(path, payload)
+
+    # Now append a second event through the normal path.  EventLog will
+    # notice the on-disk file during its lock-and-sync step and report
+    # synced_count=1, which should trigger a full view rebuild.
+    second_msg = message_event("second")
+    state.append_event(second_msg)
+
+    # Both events should be in the view (rebuilt from the full log).
+    assert len(state.view) == 2
+    view_ids = {e.id for e in state.view.events}
+    assert sneaky_msg.id in view_ids
+    assert second_msg.id in view_ids

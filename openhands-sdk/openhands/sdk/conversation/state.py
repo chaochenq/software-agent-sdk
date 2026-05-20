@@ -207,9 +207,10 @@ class ConversationState(OpenHandsModel):
     _fs: FileStore = PrivateAttr()  # filestore for persistence
     _events: EventLog = PrivateAttr()  # now the storage for events
     # Cached, incrementally-maintained projection of `_events`. Derived state,
-    # so it is intentionally not a model field and never persisted. Updated in
-    # `append_event` on every new event and fully re-derived (with property
-    # enforcement) via `rebuild_view` on cold load, fork, or error recovery.
+    # so it is intentionally not a model field and never persisted. Kept in
+    # sync with the event log via the `_on_append` callback wired by
+    # `_wire_view_sync`, and fully re-derived (with property enforcement)
+    # via `rebuild_view` on cold load, fork, or error recovery.
     # See https://github.com/OpenHands/software-agent-sdk/issues/3053.
     _view: View = PrivateAttr(default_factory=View)
     _cipher: Cipher | None = PrivateAttr(default=None)  # cipher for secret encryption
@@ -236,37 +237,40 @@ class ConversationState(OpenHandsModel):
     def view(self) -> View:
         """Cached, incrementally-maintained `View` of the conversation events.
 
-        The view is updated in lockstep with `events` via `append_event`, so it
-        always reflects the current `_events` log without paying the O(n) cost
-        of `View.from_events` on every read. It is fully re-derived (with
-        property enforcement) only by `rebuild_view`, which is intended for
-        cold load, fork, and explicit error recovery — not the per-step hot
-        path.
+        The view is kept in sync with the event log automatically: every
+        ``EventLog.append`` triggers an ``_on_append`` callback that
+        performs either an O(1) incremental update or, when the log
+        synced extra events from disk, a full ``View.from_events``
+        rebuild. The view is also fully re-derived (with property
+        enforcement) by ``rebuild_view``, intended for cold load, fork,
+        and explicit error recovery.
 
         Callers must treat the returned view as read-only. Mutating it
         breaks the cache invariant and will cause silent divergence from
-        `events`.
+        ``events``.
         """
         return self._view
 
     def append_event(self, event: Event) -> None:
         """Append an event to the conversation, updating the cached view.
 
-        This is the only sanctioned write path for adding events to a
-        running conversation: it persists the event via `EventLog.append`
-        and incrementally updates the cached `View` so the two stay in
-        sync. Callers (`_default_callback`, fork, etc.) must hold the
-        conversation lock; see callers in `LocalConversation` for the
-        canonical pattern.
+        This is the preferred write path for adding events to a running
+        conversation. It persists the event via ``EventLog.append``,
+        which in turn fires the ``_on_append`` callback to
+        incrementally update the cached ``View``.
 
         The incremental view update is O(1) for the common
-        `LLMConvertibleEvent` case and O(view-size) only when a
-        `Condensation` event is applied. It does not run
-        `enforce_properties`; that fallback path runs only via
-        `rebuild_view`.
+        ``LLMConvertibleEvent`` case and O(view-size) only when a
+        ``Condensation`` event is applied. It does not run
+        ``enforce_properties``; that fallback path runs only via
+        ``rebuild_view``.
+
+        The view cache is also maintained when events are appended
+        directly via ``state.events.append(event)`` (e.g. by external
+        callers), because the same ``_on_append`` callback is wired
+        to ``EventLog``.
         """
         self._events.append(event)
-        self._view.append_event(event)
 
     def rebuild_view(self) -> None:
         """Re-derive the cached view from the full event log.
@@ -284,6 +288,26 @@ class ConversationState(OpenHandsModel):
           view before retrying with condensation).
         """
         self._view = View.from_events(self._events)
+
+    def _wire_view_sync(self) -> None:
+        """Wire the ``EventLog._on_append`` callback to keep ``_view`` current.
+
+        Must be called after ``_events`` is assigned. Subsequent calls to
+        ``EventLog.append`` — whether via ``self.append_event`` or a
+        direct ``self.events.append`` — will automatically update the
+        cached ``_view``.
+        """
+
+        def _sync(event: Event, synced_count: int) -> None:
+            if synced_count > 0:
+                # Another writer added events between our last append and
+                # this one. The incremental view has missed those events,
+                # so a full rebuild is the only safe recovery.
+                self._view = View.from_events(self._events)
+            else:
+                self._view.append_event(event)
+
+        self._events.set_on_append(_sync)
 
     @property
     def env_observation_persistence_dir(self) -> str | None:
@@ -421,6 +445,7 @@ class ConversationState(OpenHandsModel):
             # older version of the code or otherwise be in a bad state, so
             # treating this as a cold-load checkpoint is appropriate.
             state.rebuild_view()
+            state._wire_view_sync()
 
             # Verify compatibility (agent class + tools)
             agent.verify(state.agent, events=state._events)
@@ -454,6 +479,7 @@ class ConversationState(OpenHandsModel):
         )
         state._fs = file_store
         state._events = EventLog(file_store, dir_path=EVENTS_DIR)
+        state._wire_view_sync()
         state._cipher = cipher
         state.stats = ConversationStats()
 

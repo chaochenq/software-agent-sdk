@@ -198,10 +198,10 @@ class LocalConversation(BaseConversation):
             # This callback runs while holding the conversation state's lock
             # (see BaseConversation.compose_callbacks usage inside `with self._state:`
             # regions), so updating state here is thread-safe.
-            # Using `append_event` (instead of `state.events.append`) also
-            # incrementally updates the cached `state.view`, keeping the view
-            # in sync without paying the O(n) `View.from_events` cost on each
-            # step.
+            # `append_event` persists via EventLog.append, whose `_on_append`
+            # callback incrementally updates the cached `state.view`, keeping
+            # the view in sync without paying the O(n) `View.from_events`
+            # cost on each step.
             self._state.append_event(e)
             # Track user MessageEvent IDs here so hook callbacks (which may
             # synthesize or alter user messages) are captured in one place.
@@ -1154,14 +1154,13 @@ class LocalConversation(BaseConversation):
                 ")"
             )
 
-        # Add a condensation request event
+        # Force the agent to take a single step to process the condensation request.
+        # Both the request event emission and the step must be under the state
+        # lock so that the view mutation in _on_event cannot race with a
+        # concurrent run().
         condensation_request = CondensationRequest()
-        self._on_event(condensation_request)
-
-        # Force the agent to take a single step to process the condensation request
-        # This will trigger the condenser if it handles condensation requests
         with self._state:
-            # Take a single step to process the condensation request
+            self._on_event(condensation_request)
             self.agent.step(self, on_event=self._on_event, on_token=self._on_token)
 
         logger.info("Condensation request processed")
