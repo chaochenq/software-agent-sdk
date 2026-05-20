@@ -1,8 +1,7 @@
 """Example: Defining a sub-agent inline with AgentDefinition.
 
 Defines a grammar-checker sub-agent using AgentDefinition, registers it,
-and delegates work to it from an orchestrator agent. The orchestrator then
-asks the builtin default agent to judge the results.
+and delegates work to it from an orchestrator agent.
 """
 
 import os
@@ -57,8 +56,7 @@ conversation = Conversation(
 # 4. Ask the orchestrator to delegate to our agent
 task = (
     "Please delegate to the grammar-checker agent and ask it to review "
-    "the README.md file in search of grammatical errors.\n"
-    "Then ask the default agent to judge the errors."
+    "the README.md file in search of grammatical errors."
 )
 conversation.send_message(task)
 conversation.run()
