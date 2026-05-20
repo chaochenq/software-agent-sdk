@@ -199,6 +199,26 @@ def test_browser_toolset_shared_executor_reset():
         assert executor1 is not executor2
 
 
+def test_browser_toolset_does_not_hold_shared_lock_while_constructing():
+    """Regression test for stale executor finalizers deadlocking create()."""
+
+    def fake_init(self, **_kwargs):
+        assert not BrowserToolSet._shared_executor_lock.locked()
+        self.full_output_save_dir = None
+        self._initialized = False
+        self._cleanup_initiated = True
+        self._action_timeout_seconds = 30.0
+        self._async_executor = MagicMock()
+        self._async_executor.close = MagicMock()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        conv_state = _create_test_conv_state(temp_dir)
+        with patch.object(BrowserToolExecutor, "__init__", fake_init):
+            tools = BrowserToolSet.create(conv_state=conv_state)
+
+    assert tools[0].executor is BrowserToolSet._shared_executor
+
+
 def test_browser_toolset_warns_when_config_ignored(caplog):
     """
     Test that a warning is logged when a second create()
