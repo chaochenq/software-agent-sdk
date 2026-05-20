@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, TypeVar
@@ -276,6 +277,7 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
     _initialized: bool
     _async_executor: AsyncExecutor
     _cleanup_initiated: bool
+    _close_lock: threading.Lock
     _action_timeout_seconds: float
 
     @staticmethod
@@ -399,6 +401,7 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
         self._initialized = False
         self._async_executor = AsyncExecutor()
         self._cleanup_initiated = False
+        self._close_lock = threading.Lock()
         self._action_timeout_seconds = action_timeout_seconds
         self._consecutive_failures = 0
 
@@ -705,26 +708,27 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
 
     def close(self):
         """Close the browser executor and cleanup resources."""
-        shared_close_lock_acquired = self._detach_shared_executor_for_close()
-        if self._cleanup_initiated:
-            if shared_close_lock_acquired:
-                self._release_shared_executor_creation_lock()
-            return
-        self._cleanup_initiated = True
-        try:
-            # Run cleanup in the async executor with a shorter timeout
-            self._async_executor.run_async(self.cleanup, timeout=30.0)
-        except Exception as e:
-            logger.warning(f"Error during browser cleanup: {e}")
-        finally:
-            try:
-                # Always close the async executor
-                self._async_executor.close()
-            finally:
+        with self._close_lock:
+            shared_close_lock_acquired = self._detach_shared_executor_for_close()
+            if self._cleanup_initiated:
                 if shared_close_lock_acquired:
                     self._release_shared_executor_creation_lock()
-                else:
-                    self._release_shared_executor_reference()
+                return
+            self._cleanup_initiated = True
+            try:
+                # Run cleanup in the async executor with a shorter timeout
+                self._async_executor.run_async(self.cleanup, timeout=30.0)
+            except Exception as e:
+                logger.warning(f"Error during browser cleanup: {e}")
+            finally:
+                try:
+                    # Always close the async executor
+                    self._async_executor.close()
+                finally:
+                    if shared_close_lock_acquired:
+                        self._release_shared_executor_creation_lock()
+                    else:
+                        self._release_shared_executor_reference()
 
     def _detach_shared_executor_for_close(self) -> bool:
         from openhands.tools.browser_use.definition import BrowserToolSet

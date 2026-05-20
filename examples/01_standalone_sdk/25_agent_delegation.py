@@ -99,6 +99,7 @@ register_builtins_agents()
 main_agent = Agent(
     llm=llm,
     tools=[Tool(name=TaskToolSet.name)],
+    tool_concurrency_limit=2,
 )
 conversation = Conversation(
     agent=main_agent,
