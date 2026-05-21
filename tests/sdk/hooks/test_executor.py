@@ -720,7 +720,7 @@ class TestPromptHookNotImplemented:
 
     def test_prompt_hook_defaults_to_allow(self, executor, sample_event):
         """Executing a PROMPT hook returns allow instead of crashing."""
-        hook = HookDefinition(type="prompt")
+        hook = HookDefinition(type="prompt", prompt="evaluate this event")
         result = executor.execute(hook, sample_event)
         assert result.decision == HookDecision.ALLOW
         assert result.success is False
@@ -728,12 +728,12 @@ class TestPromptHookNotImplemented:
 
     def test_prompt_hook_does_not_block(self, executor, sample_event):
         """PROMPT hook must not block the operation while unimplemented."""
-        hook = HookDefinition(type="prompt")
+        hook = HookDefinition(type="prompt", prompt="evaluate this event")
         result = executor.execute(hook, sample_event)
         assert result.blocked is False
         assert result.should_continue is True
 
     def test_prompt_hook_without_command_validates(self):
         """PROMPT hook with no command is valid at config time (future use)."""
-        hook = HookDefinition(type="prompt")
+        hook = HookDefinition(type="prompt", prompt="evaluate this event")
         assert hook.command is None

@@ -50,6 +50,7 @@ class HookDefinition(BaseModel):
     type: HookType = HookType.COMMAND
     name: str | None = None
     command: str | None = None
+    prompt: str | None = None
     system_prompt: str | None = None
     tools: list[str] = Field(default_factory=list)
     timeout: int = 60
@@ -84,6 +85,7 @@ class HookDefinition(BaseModel):
         if self.system_prompt:
             return f"agent-hook:{self.system_prompt[:20]}"
         return "agent-hook:agent"
+
 
 class HookMatcher(BaseModel):
     """Matches events to hooks based on patterns.
