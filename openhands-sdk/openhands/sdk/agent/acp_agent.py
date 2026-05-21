@@ -1266,6 +1266,213 @@ class ACPAgent(AgentBase):
             return None
         return blocks
 
+    # ------------------------------------------------------------------
+    # Shared step / astep implementation
+    # ------------------------------------------------------------------
+    #
+    # ``step`` (sync) and ``astep`` (async) both drive the same logical
+    # turn: send the latest user message to the ACP subprocess, await its
+    # response, emit FinishAction + ObservationEvent.  The only thing
+    # they differ on is HOW they await ``self._conn.prompt(...)`` — the
+    # connection is bound to the AnyIO BlockingPortal's loop (set up in
+    # ``_start_acp_server``), which lives on its own thread.
+    #
+    # * ``step``  runs entirely on a single caller thread.  It uses
+    #             ``self._executor.run_async(...)`` to block the caller
+    #             while the prompt coroutine runs on the portal loop.
+    # * ``astep`` runs on the caller's asyncio event loop (e.g.
+    #             ``LocalConversation.arun``'s loop, which is also the
+    #             FIFOLock owner).  It uses
+    #             ``portal.start_task_soon(...) + asyncio.wrap_future``
+    #             to schedule the prompt on the portal loop AND await
+    #             its result back on the caller's loop — without leaving
+    #             the caller's thread.  All post-prompt work
+    #             (``_record_usage`` → ``stats_callback``, event
+    #             emission, status mutations) therefore happens on the
+    #             caller's thread, where the conversation state lock is
+    #             already held re-entrantly.  This is what avoids the
+    #             cross-thread state-lock deadlock described in #3348.
+    #
+    # The default ``AgentBase.astep`` would otherwise wrap ``step`` in
+    # ``loop.run_in_executor(None, self.step, ...)``, scheduling step on
+    # an unrelated executor thread while ``arun`` holds the state lock on
+    # the loop thread — every state-lock acquire inside step's call chain
+    # would then deadlock.
+
+    async def _do_acp_prompt(self, prompt_blocks: list[Any]) -> PromptResponse:
+        """Single ACP ``conn.prompt`` call + optional UsageUpdate sync.
+
+        Always runs on the portal's loop (where ``self._conn`` lives).
+        Does not implement retry — callers wrap this in their own retry
+        loop so the loop can use ``time.sleep`` (sync path) or
+        ``asyncio.sleep`` (async path) appropriately.
+        """
+        usage_sync = self._client.prepare_usage_sync(self._session_id or "")
+        response = await self._conn.prompt(prompt_blocks, self._session_id)
+        if self._client.get_turn_usage_update(self._session_id or "") is None:
+            try:
+                await asyncio.wait_for(usage_sync.wait(), timeout=_USAGE_UPDATE_TIMEOUT)
+            except TimeoutError:
+                logger.warning(
+                    "UsageUpdate not received within %.1fs for session %s",
+                    _USAGE_UPDATE_TIMEOUT,
+                    self._session_id,
+                )
+        return response
+
+    def _finalize_successful_turn(
+        self,
+        response: PromptResponse | None,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        """Common post-prompt bookkeeping.  Sync — runs on caller thread."""
+        session_id = self._session_id or ""
+        usage_update = self._client.pop_turn_usage_update(session_id)
+        self._record_usage(
+            response,
+            session_id,
+            elapsed=elapsed,
+            usage_update=usage_update,
+        )
+
+        # ACPToolCallEvents were already emitted live from
+        # _OpenHandsACPBridge.session_update as each ToolCallStart /
+        # ToolCallProgress notification arrived — no end-of-turn fan-out
+        # here. FinishAction closes out the turn below.
+
+        response_text = "".join(self._client.accumulated_text)
+        thought_text = "".join(self._client.accumulated_thoughts)
+        if not response_text:
+            response_text = "(No response from ACP server)"
+
+        # ACP step() boundaries are full remote assistant turns, not
+        # partial planning steps. Emit FinishAction to delimit that
+        # completed turn for eval/remote consumers, matching #2190.
+        finish_action = FinishAction(message=response_text)
+        tc_id = str(uuid.uuid4())
+        action_event = ActionEvent(
+            source="agent",
+            thought=[],
+            reasoning_content=thought_text or None,
+            action=finish_action,
+            tool_name="finish",
+            tool_call_id=tc_id,
+            tool_call=MessageToolCall(
+                id=tc_id,
+                name="finish",
+                arguments=json.dumps({"message": response_text}),
+                origin="completion",
+            ),
+            llm_response_id=str(uuid.uuid4()),
+        )
+        on_event(action_event)
+        on_event(
+            ObservationEvent(
+                observation=FinishObservation.from_text(text=response_text),
+                action_id=action_event.id,
+                tool_name="finish",
+                tool_call_id=tc_id,
+            )
+        )
+        state.execution_status = ConversationExecutionStatus.FINISHED
+
+    def _emit_turn_timeout(
+        self,
+        elapsed: float,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        """Emit the error message + status flip when a turn times out."""
+        logger.error(
+            "ACP prompt timed out after %.1fs (limit=%.0fs). "
+            "The ACP server may have completed its work but failed to "
+            "send the JSON-RPC response. Accumulated %d text chunks, "
+            "%d tool calls.",
+            elapsed,
+            self.acp_prompt_timeout,
+            len(self._client.accumulated_text),
+            len(self._client.accumulated_tool_calls),
+        )
+        error_message = Message(
+            role="assistant",
+            content=[
+                TextContent(
+                    text=(
+                        f"ACP prompt timed out after {elapsed:.0f}s. "
+                        "The agent may have completed its work but "
+                        "the response was not received."
+                    )
+                )
+            ],
+        )
+        # Close any tool cards left in flight from the timed-out attempt.
+        self._cancel_inflight_tool_calls()
+        on_event(MessageEvent(source="agent", llm_message=error_message))
+        state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _emit_turn_error(
+        self,
+        exc: BaseException,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        """Emit the error event pair when a turn fails (non-timeout)."""
+        logger.error("ACP prompt failed: %s", exc, exc_info=True)
+        error_str = str(exc)
+
+        # Close any tool cards left in flight before surfacing the error.
+        self._cancel_inflight_tool_calls()
+
+        # Emit error as an agent message (existing behavior, preserved for
+        # consumers that inspect MessageEvents).
+        error_message = Message(
+            role="assistant",
+            content=[TextContent(text=f"ACP error: {exc}")],
+        )
+        on_event(MessageEvent(source="agent", llm_message=error_message))
+
+        # Emit typed ConversationErrorEvent so RemoteConversation can
+        # report the actual error detail via _get_last_error_detail()
+        # instead of falling back to "Remote conversation ended with error".
+        is_aup = (
+            "usage policy" in error_str.lower() or "content policy" in error_str.lower()
+        )
+        on_event(
+            ConversationErrorEvent(
+                source="agent",
+                code="UsagePolicyRefusal" if is_aup else "ACPPromptError",
+                detail=error_str[:500],
+            )
+        )
+        state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _clear_turn_callbacks(self) -> None:
+        """Unwire per-turn callbacks so trailing session_update is a no-op.
+
+        Called from both ``step`` and ``astep`` ``finally`` blocks.  If the
+        ACP subprocess later dispatches a trailing ``session_update`` (e.g.
+        between turns), it fires on the portal thread with no FIFOLock held
+        by anyone — firing a stale ``on_event`` there would race with
+        other threads mutating ``state.events``.  Clearing the callbacks
+        turns any such late update into a no-op emit.
+        """
+        self._client.on_event = None
+        self._client.on_token = None
+        self._client.on_activity = None
+
+    def _build_prompt_blocks_for_latest_user_message(
+        self, state: ConversationState
+    ) -> list[Any] | None:
+        """Walk events in reverse for the latest user MessageEvent."""
+        for event in reversed(list(state.events)):
+            if isinstance(event, MessageEvent) and event.source == "user":
+                blocks = self._build_acp_prompt(event)
+                if blocks:
+                    return blocks
+        return None
+
     @observe(name="acp_agent.step", ignore_inputs=["conversation", "on_event"])
     def step(
         self,
@@ -1273,19 +1480,16 @@ class ACPAgent(AgentBase):
         on_event: ConversationCallbackType,
         on_token: ConversationTokenCallbackType | None = None,
     ) -> None:
-        """Send the latest user message to the ACP server and emit the response."""
+        """Send the latest user message to the ACP server and emit the response.
+
+        Sync entry point — used by callers that don't already have an
+        asyncio loop running (CLI, eval harness, ``LocalConversation.run``).
+        ``LocalConversation.arun`` goes through :meth:`astep` instead, which
+        avoids the cross-thread state-lock deadlock described in #3348.
+        """
         state = conversation.state
 
-        # Find the latest user message. Conversation implementations already
-        # attach per-turn AgentContext extensions to MessageEvent.extended_content;
-        # MessageEvent.to_llm_message() merges those extensions with the user text.
-        prompt_blocks = None
-        for event in reversed(list(state.events)):
-            if isinstance(event, MessageEvent) and event.source == "user":
-                prompt_blocks = self._build_acp_prompt(event)
-                if prompt_blocks:
-                    break
-
+        prompt_blocks = self._build_prompt_blocks_for_latest_user_message(state)
         if prompt_blocks is None:
             logger.warning("No user message found; finishing conversation")
             state.execution_status = ConversationExecutionStatus.FINISHED
@@ -1295,37 +1499,16 @@ class ACPAgent(AgentBase):
 
         t0 = time.monotonic()
         try:
-
-            async def _prompt() -> PromptResponse:
-                usage_sync = self._client.prepare_usage_sync(self._session_id or "")
-                response = await self._conn.prompt(
-                    prompt_blocks,
-                    self._session_id,
-                )
-                if self._client.get_turn_usage_update(self._session_id or "") is None:
-                    try:
-                        await asyncio.wait_for(
-                            usage_sync.wait(), timeout=_USAGE_UPDATE_TIMEOUT
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "UsageUpdate not received within %.1fs for session %s",
-                            _USAGE_UPDATE_TIMEOUT,
-                            self._session_id,
-                        )
-                return response
-
-            # Send prompt to ACP server with retry logic for connection errors.
-            # Transient connection failures (network blips, server restarts) are
-            # retried to preserve session state and avoid losing progress.
             logger.info(
                 "Sending ACP prompt (timeout=%.0fs, blocks=%d)",
                 self.acp_prompt_timeout,
                 len(prompt_blocks),
             )
-
             response: PromptResponse | None = None
             max_retries = _ACP_PROMPT_MAX_RETRIES
+
+            async def _prompt() -> PromptResponse:
+                return await self._do_acp_prompt(prompt_blocks)
 
             for attempt in range(max_retries + 1):
                 try:
@@ -1341,8 +1524,8 @@ class ACPAgent(AgentBase):
                             min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
                         ]
                         logger.warning(
-                            "ACP prompt failed with retriable error (attempt %d/%d), "
-                            "retrying in %.0fs: %s",
+                            "ACP prompt failed with retriable error "
+                            "(attempt %d/%d), retrying in %.0fs: %s",
                             attempt + 1,
                             max_retries + 1,
                             delay,
@@ -1355,8 +1538,8 @@ class ACPAgent(AgentBase):
                         raise
                 except ACPRequestError as e:
                     # Retry transient server errors (e.g. "Internal Server
-                    # Error" from Gemini).  These are JSON-RPC -32603 errors
-                    # that indicate a server-side failure, not a client bug.
+                    # Error" from Gemini).  JSON-RPC -32603 = server-side
+                    # failure, not a client bug.
                     if (
                         e.code in _RETRIABLE_SERVER_ERROR_CODES
                         and attempt < max_retries
@@ -1365,8 +1548,8 @@ class ACPAgent(AgentBase):
                             min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
                         ]
                         logger.warning(
-                            "ACP prompt failed with server error (attempt %d/%d), "
-                            "retrying in %.0fs: [%d] %s",
+                            "ACP prompt failed with server error "
+                            "(attempt %d/%d), retrying in %.0fs: [%d] %s",
                             attempt + 1,
                             max_retries + 1,
                             delay,
@@ -1381,135 +1564,140 @@ class ACPAgent(AgentBase):
 
             elapsed = time.monotonic() - t0
             logger.info("ACP prompt returned in %.1fs", elapsed)
-
-            session_id = self._session_id or ""
-            usage_update = self._client.pop_turn_usage_update(session_id)
-            self._record_usage(
-                response,
-                session_id,
-                elapsed=elapsed,
-                usage_update=usage_update,
-            )
-
-            # ACPToolCallEvents were already emitted live from
-            # _OpenHandsACPBridge.session_update as each ToolCallStart /
-            # ToolCallProgress notification arrived — no end-of-turn fan-out
-            # here. FinishAction closes out the turn below.
-
-            # Build response message
-            response_text = "".join(self._client.accumulated_text)
-            thought_text = "".join(self._client.accumulated_thoughts)
-
-            if not response_text:
-                response_text = "(No response from ACP server)"
-
-            # ACP step() boundaries are full remote assistant turns, not
-            # partial planning steps. Emit FinishAction to delimit that
-            # completed turn for eval/remote consumers, matching #2190.
-            finish_action = FinishAction(message=response_text)
-            tc_id = str(uuid.uuid4())
-            action_event = ActionEvent(
-                source="agent",
-                thought=[],
-                reasoning_content=thought_text or None,
-                action=finish_action,
-                tool_name="finish",
-                tool_call_id=tc_id,
-                tool_call=MessageToolCall(
-                    id=tc_id,
-                    name="finish",
-                    arguments=json.dumps({"message": response_text}),
-                    origin="completion",
-                ),
-                llm_response_id=str(uuid.uuid4()),
-            )
-            on_event(action_event)
-            on_event(
-                ObservationEvent(
-                    observation=FinishObservation.from_text(text=response_text),
-                    action_id=action_event.id,
-                    tool_name="finish",
-                    tool_call_id=tc_id,
-                )
-            )
-
-            state.execution_status = ConversationExecutionStatus.FINISHED
-
+            self._finalize_successful_turn(response, elapsed, state, on_event)
         except TimeoutError:
-            elapsed = time.monotonic() - t0
-            logger.error(
-                "ACP prompt timed out after %.1fs (limit=%.0fs). "
-                "The ACP server may have completed its work but failed to "
-                "send the JSON-RPC response. Accumulated %d text chunks, "
-                "%d tool calls.",
-                elapsed,
-                self.acp_prompt_timeout,
-                len(self._client.accumulated_text),
-                len(self._client.accumulated_tool_calls),
-            )
-            error_message = Message(
-                role="assistant",
-                content=[
-                    TextContent(
-                        text=(
-                            f"ACP prompt timed out after {elapsed:.0f}s. "
-                            "The agent may have completed its work but "
-                            "the response was not received."
-                        )
-                    )
-                ],
-            )
-            # Close any tool cards left in flight from the timed-out attempt.
-            self._cancel_inflight_tool_calls()
-            on_event(MessageEvent(source="agent", llm_message=error_message))
-            state.execution_status = ConversationExecutionStatus.ERROR
+            self._emit_turn_timeout(time.monotonic() - t0, state, on_event)
         except Exception as e:
-            logger.error("ACP prompt failed: %s", e, exc_info=True)
-            error_str = str(e)
-
-            # Close any tool cards left in flight before surfacing the error.
-            self._cancel_inflight_tool_calls()
-
-            # Emit error as an agent message (existing behavior, preserved for
-            # consumers that inspect MessageEvents)
-            error_message = Message(
-                role="assistant",
-                content=[TextContent(text=f"ACP error: {e}")],
-            )
-            on_event(MessageEvent(source="agent", llm_message=error_message))
-
-            # Emit typed ConversationErrorEvent so RemoteConversation can
-            # report the actual error detail via _get_last_error_detail()
-            # instead of falling back to "Remote conversation ended with error"
-            is_aup = (
-                "usage policy" in error_str.lower()
-                or "content policy" in error_str.lower()
-            )
-            on_event(
-                ConversationErrorEvent(
-                    source="agent",
-                    code="UsagePolicyRefusal" if is_aup else "ACPPromptError",
-                    detail=error_str[:500],
-                )
-            )
-
-            state.execution_status = ConversationExecutionStatus.ERROR
-
+            self._emit_turn_error(e, state, on_event)
             # Re-raise so LocalConversation.run()'s outer except handler
             # breaks the loop, emits ConversationErrorEvent, and raises
-            # ConversationRunError — matching how the regular Agent works
+            # ConversationRunError — matching how the regular Agent works.
             raise
         finally:
-            # Unwire the per-turn callbacks now that this step has finished
-            # emitting everything it's going to emit.  If the ACP subprocess
-            # later dispatches a trailing ``session_update`` (e.g. between
-            # turns), it fires on the portal thread with no FIFOLock held
-            # by anyone — firing a stale ``on_event`` there would race
-            # with other threads mutating ``state.events``.  Clearing the
-            # callbacks turns any such late update into a no-op emit.
-            self._client.on_event = None
-            self._client.on_token = None
-            self._client.on_activity = None
+            self._clear_turn_callbacks()
+
+    @observe(name="acp_agent.astep", ignore_inputs=["conversation", "on_event"])
+    async def astep(
+        self,
+        conversation: LocalConversation,
+        on_event: ConversationCallbackType,
+        on_token: ConversationTokenCallbackType | None = None,
+    ) -> None:
+        """Native-async variant of :meth:`step`.
+
+        Schedules the ACP ``conn.prompt(...)`` round-trip on the portal
+        loop (where the connection lives) via
+        ``BlockingPortal.start_task_soon`` and awaits the result back on
+        the caller's loop via ``asyncio.wrap_future``.  Post-prompt work
+        (``_record_usage`` → telemetry callbacks → ``on_event`` calls →
+        state mutations) runs entirely on the caller's thread.
+
+        Why this matters: ``LocalConversation.arun`` holds the
+        conversation state's ``FIFOLock`` on its own loop thread across
+        ``await self.agent.astep(...)``.  The default
+        ``AgentBase.astep`` would wrap sync ``step`` in
+        ``loop.run_in_executor(None, self.step, ...)``, moving every
+        post-prompt callback (notably ``stats_callback``) to an
+        executor worker thread — a different thread from the lock
+        owner.  Any ``with state:`` inside those callbacks then blocks
+        on a lock owned by a thread that is itself ``await``-ing
+        ``astep`` to return.  See #3348 / #3350 for the full diagnosis.
+        Keeping post-prompt work on the caller's thread sidesteps the
+        whole class of cross-thread state-lock deadlocks.
+        """
+        state = conversation.state
+
+        prompt_blocks = self._build_prompt_blocks_for_latest_user_message(state)
+        if prompt_blocks is None:
+            logger.warning("No user message found; finishing conversation")
+            state.execution_status = ConversationExecutionStatus.FINISHED
+            return
+
+        self._reset_client_for_turn(on_token, on_event)
+
+        t0 = time.monotonic()
+        try:
+            logger.info(
+                "Sending ACP prompt (timeout=%.0fs, blocks=%d, async)",
+                self.acp_prompt_timeout,
+                len(prompt_blocks),
+            )
+            portal = self._executor._ensure_portal()
+
+            response: PromptResponse | None = None
+            max_retries = _ACP_PROMPT_MAX_RETRIES
+            for attempt in range(max_retries + 1):
+                try:
+                    # Schedule the ACP prompt on the portal loop (where the
+                    # connection lives) and await the result on the caller
+                    # loop.  ``asyncio.wait_for`` enforces the per-attempt
+                    # timeout symmetrically with the sync path's
+                    # ``run_async(timeout=...)``.
+                    future = portal.start_task_soon(self._do_acp_prompt, prompt_blocks)
+                    response = await asyncio.wait_for(
+                        asyncio.wrap_future(future),
+                        timeout=self.acp_prompt_timeout,
+                    )
+                    break
+                except TimeoutError:
+                    # ``asyncio.TimeoutError`` aliases ``TimeoutError`` on
+                    # Python 3.11+ — same except clause catches both.
+                    # Surface to the outer handler below so step and astep
+                    # share error-event semantics.
+                    raise TimeoutError(
+                        f"ACP prompt timed out after {self.acp_prompt_timeout:.0f}s"
+                    )
+                except _RETRIABLE_CONNECTION_ERRORS as e:
+                    if attempt < max_retries:
+                        delay = _ACP_PROMPT_RETRY_DELAYS[
+                            min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
+                        ]
+                        logger.warning(
+                            "ACP prompt failed with retriable error "
+                            "(attempt %d/%d), retrying in %.0fs: %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            delay,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        self._cancel_inflight_tool_calls()
+                        self._reset_client_for_turn(on_token, on_event)
+                    else:
+                        raise
+                except ACPRequestError as e:
+                    if (
+                        e.code in _RETRIABLE_SERVER_ERROR_CODES
+                        and attempt < max_retries
+                    ):
+                        delay = _ACP_PROMPT_RETRY_DELAYS[
+                            min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
+                        ]
+                        logger.warning(
+                            "ACP prompt failed with server error "
+                            "(attempt %d/%d), retrying in %.0fs: [%d] %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            delay,
+                            e.code,
+                            e,
+                        )
+                        await asyncio.sleep(delay)
+                        self._cancel_inflight_tool_calls()
+                        self._reset_client_for_turn(on_token, on_event)
+                    else:
+                        raise
+
+            elapsed = time.monotonic() - t0
+            logger.info("ACP prompt returned in %.1fs (async)", elapsed)
+            self._finalize_successful_turn(response, elapsed, state, on_event)
+        except TimeoutError:
+            self._emit_turn_timeout(time.monotonic() - t0, state, on_event)
+        except Exception as e:
+            self._emit_turn_error(e, state, on_event)
+            raise
+        finally:
+            self._clear_turn_callbacks()
 
     def ask_agent(self, question: str) -> str | None:
         """Fork the ACP session, prompt the fork, and return the response."""

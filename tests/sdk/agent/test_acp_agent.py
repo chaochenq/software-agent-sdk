@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1297,6 +1298,175 @@ class TestACPAgentStep:
         assert wired_during_prompt == [on_token]
         # And unwired afterward so a late token chunk is a no-op.
         assert mock_client.on_token is None
+
+
+# ---------------------------------------------------------------------------
+# Async step (astep) — regression coverage for #3348 / #3350
+# ---------------------------------------------------------------------------
+
+
+class TestACPAgentAstep:
+    """Native ``ACPAgent.astep`` must not fall back to
+    ``AgentBase.astep`` (which runs ``step`` via
+    ``loop.run_in_executor``).  Doing so would move post-prompt work
+    (e.g. ``stats_callback``'s ``with state:`` re-entry) onto an
+    executor worker thread, deadlocking against
+    ``LocalConversation.arun`` which holds the state's reentrant
+    ``FIFOLock`` on the loop thread.  See OpenHands/software-agent-sdk
+    issues #3348 and #3350.
+    """
+
+    def _make_conversation_with_message(self, tmp_path, text="Hello"):
+        state = _make_state(tmp_path)
+        state.events.append(
+            SystemPromptEvent(
+                source="agent",
+                system_prompt=TextContent(text="ACP-managed agent"),
+                tools=[],
+            )
+        )
+        state.events.append(
+            MessageEvent(
+                source="user",
+                llm_message=Message(role="user", content=[TextContent(text=text)]),
+            )
+        )
+        conversation = MagicMock()
+        conversation.state = state
+        return conversation
+
+    def test_astep_overrides_default_agentbase_implementation(self):
+        """The architectural fix: ACPAgent must define its own ``astep``.
+
+        If this assertion ever flips back, the default
+        ``AgentBase.astep`` will route ACP traffic through
+        ``loop.run_in_executor(None, self.step, ...)`` again, which
+        deadlocks against ``LocalConversation.arun``.
+        """
+        assert ACPAgent.astep is not AgentBase.astep
+
+    def test_astep_runs_post_prompt_callbacks_on_caller_thread(self, tmp_path):
+        """Post-prompt ``on_event`` callbacks fire on the caller thread.
+
+        This is the structural property that defeats the #3348 deadlock:
+        ``stats_callback`` (registered downstream of ``_record_usage``)
+        does ``with state:`` — re-entering the conversation state's
+        FIFOLock.  FIFOLock is reentrant **on the same thread**.  If
+        ``astep`` schedules ``step`` on a worker thread (the buggy
+        default), the callback runs on a different thread from the
+        lock owner and blocks forever.  Asserting on threading.get_ident
+        here is sufficient — the deadlock is downstream of this
+        invariant.
+        """
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+
+        caller_thread_id = threading.get_ident()
+        prompt_thread_id: list[int] = []
+        on_event_thread_ids: list[int] = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt_blocks, session_id):
+            # This must run on the portal loop's thread, not the caller's.
+            prompt_thread_id.append(threading.get_ident())
+            mock_client.accumulated_text.append("answer")
+            return None
+
+        agent._conn.prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+
+            def _capture_event(event):
+                on_event_thread_ids.append(threading.get_ident())
+
+            asyncio.run(agent.astep(conversation, on_event=_capture_event))
+        finally:
+            executor.close()
+
+        # Prompt ran on the portal's thread — proving we actually crossed
+        # the loop boundary and didn't just await on the caller loop.
+        assert len(prompt_thread_id) == 1
+        assert prompt_thread_id[0] != caller_thread_id
+
+        # All on_event callbacks (ActionEvent + ObservationEvent) ran
+        # back on the caller's thread — proving post-prompt work was
+        # NOT moved to a worker thread.
+        assert len(on_event_thread_ids) >= 2
+        for tid in on_event_thread_ids:
+            assert tid == caller_thread_id, (
+                f"on_event ran on thread {tid} instead of caller "
+                f"{caller_thread_id} — astep regressed to thread-pool path"
+            )
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+
+    def test_astep_does_not_deadlock_under_reentrant_state_lock(self, tmp_path):
+        """End-to-end: ``arun``-shaped caller can ``await astep`` while
+        holding ``state.lock``.
+
+        This mirrors what ``LocalConversation.arun`` does — it holds
+        ``state.lock`` on the asyncio loop thread across the await.
+        With the architectural fix in place, post-prompt callbacks
+        re-enter the lock on the same thread (FIFOLock is reentrant)
+        and astep returns promptly.  Without the fix, callbacks run on
+        a worker thread, hit the lock owned by the loop thread, and
+        the await never returns.
+        """
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        state = conversation.state
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt_blocks, session_id):
+            mock_client.accumulated_text.append("done")
+            return None
+
+        agent._conn.prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+
+            # Reproduce stats_callback's pattern: on each event, take the
+            # state lock briefly.  Same-thread reentrancy must succeed.
+            def _capture_event(event):
+                with state:
+                    pass
+
+            async def _arun_shaped() -> None:
+                # arun holds the state lock across astep — same shape as
+                # LocalConversation.arun.
+                with state:
+                    await asyncio.wait_for(
+                        agent.astep(conversation, on_event=_capture_event),
+                        timeout=10.0,
+                    )
+
+            asyncio.run(_arun_shaped())
+        finally:
+            executor.close()
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
 
 
 # ---------------------------------------------------------------------------
