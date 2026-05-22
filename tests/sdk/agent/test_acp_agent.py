@@ -1707,15 +1707,16 @@ class TestACPAgentAstep:
             async def _drive() -> None:
                 await agent.astep(conversation, on_event=_capture)
                 # astep's finally has run deactivate() + _clear_turn_callbacks.
-                # Now simulate a stragglerportal-thread session_update that
+                # Now simulate a straggler portal-thread session_update that
                 # somehow still holds the (now stale) marshaller reference
-                # and fires.  call_soon_threadsafe schedules onto our
-                # running loop; one more loop tick processes it.
+                # and fires.  ``deactivate()`` already set ``_active=False``,
+                # so the marshaller's ``__call__`` short-circuits at the
+                # entry guard — this test exercises that guard.  The
+                # separate ``_deferred``-guard test below covers the case
+                # where a ``call_soon_threadsafe`` entry has already been
+                # queued before deactivation.
                 assert len(stashed_marshaller) == 1
                 marshaller = stashed_marshaller[0]
-                # Run from a worker thread so the cross-thread branch
-                # (call_soon_threadsafe) is exercised, not the same-thread
-                # shortcut.
                 done = threading.Event()
 
                 def _fire_from_other_thread():
@@ -1737,7 +1738,7 @@ class TestACPAgentAstep:
                 t.start()
                 t.join()
                 # Yield twice so any pending call_soon_threadsafe entry
-                # gets a chance to tick.
+                # would get a chance to tick.
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
 
@@ -1753,6 +1754,95 @@ class TestACPAgentAstep:
         assert late_events == [], (
             f"late marshalled callback should have been dropped after "
             f"deactivate(), but reached user on_event: {late_events}"
+        )
+
+    def test_astep_deferred_dropped_when_deactivated_after_enqueue(self, tmp_path):
+        """Exercises ``_CallerLoopMarshaller._deferred``'s active guard.
+
+        Sister test to ``test_astep_drops_late_bridge_callbacks_after_turn``,
+        which exercises only the entry-guard short-circuit (because by
+        the time it fires, ``deactivate()`` has already been called).
+        Here we manually queue ``marshaller._deferred`` via
+        ``call_soon_threadsafe`` BEFORE deactivation — same race as a
+        portal-thread ``session_update`` that fires while astep is still
+        in flight but whose loop tick lands after astep's ``finally``.
+        We then deactivate, yield the loop, and assert the user's
+        ``on_event`` was not invoked.
+        """
+        from openhands.sdk.event import ACPToolCallEvent
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        user_callback_invocations: list = []
+        stashed_marshaller: list = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+
+        async def _fake_prompt(prompt_blocks, session_id):
+            stashed_marshaller.append(mock_client.on_event)
+            mock_client.accumulated_text.append("ok")
+            return None
+
+        agent._conn.prompt = _fake_prompt
+        agent._session_id = "test-session"
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+
+            def _capture(event):
+                user_callback_invocations.append(event)
+
+            async def _drive() -> None:
+                await agent.astep(conversation, on_event=_capture)
+                assert len(stashed_marshaller) == 1
+                marshaller = stashed_marshaller[0]
+
+                # astep's finally has already called deactivate().  Force
+                # ``_active`` back to True so we can simulate the race:
+                # ``__call__`` fired and enqueued ``_deferred`` via
+                # ``call_soon_threadsafe`` BEFORE deactivation lands.
+                marshaller._active = True
+                loop = asyncio.get_running_loop()
+                event = ACPToolCallEvent(
+                    tool_call_id="tc-deferred-1",
+                    title="late deferred",
+                    status="in_progress",
+                    tool_kind=None,
+                    raw_input=None,
+                    raw_output=None,
+                    content=None,
+                    is_error=False,
+                )
+                # Queue _deferred directly — this is what __call__ would
+                # do via call_soon_threadsafe from another thread.
+                loop.call_soon_threadsafe(marshaller._deferred, (event,), {})
+
+                # Now flip _active to False BEFORE the loop ticks the
+                # queued entry — this is the race the _deferred guard
+                # exists to handle.
+                marshaller.deactivate()
+
+                # Yield twice so the queued _deferred runs.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+            asyncio.run(_drive())
+        finally:
+            executor.close()
+
+        deferred_events = [
+            e
+            for e in user_callback_invocations
+            if isinstance(e, ACPToolCallEvent) and e.tool_call_id == "tc-deferred-1"
+        ]
+        assert deferred_events == [], (
+            f"_deferred should have dropped the queued callback after "
+            f"deactivate(), but reached user on_event: {deferred_events}"
         )
 
 

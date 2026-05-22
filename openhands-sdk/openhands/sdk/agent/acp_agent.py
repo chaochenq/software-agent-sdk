@@ -394,7 +394,6 @@ class _CallerLoopMarshaller:
             # already unwired this, but guard the race.
             logger.debug(
                 "caller loop closed; dropping marshalled ACP callback",
-                exc_info=True,
             )
 
     def _deferred(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
