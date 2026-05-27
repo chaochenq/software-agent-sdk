@@ -34,6 +34,11 @@ from openhands.agent_server.dependencies import (
 )
 from openhands.agent_server.desktop_router import desktop_router
 from openhands.agent_server.desktop_service import get_desktop_service
+from openhands.agent_server.docker_runtime.container_manager import ContainerManager
+from openhands.agent_server.docker_runtime.routers import (
+    docker_conversation_router,
+    docker_sockets_router,
+)
 from openhands.agent_server.event_router import event_router
 from openhands.agent_server.file_router import file_router
 from openhands.agent_server.git_router import git_router
@@ -203,9 +208,25 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
                     config.bash_events_retention_seconds,
                 )
 
+            # Docker runtime: install the per-conversation container manager.
+            # The proxy routers each construct their own short-lived
+            # ``httpx.AsyncClient`` per request, so there is no shared client
+            # to plumb in here. The in-process conversation_service stays
+            # live as well — in docker mode it just isn't routed to.
+            container_manager: ContainerManager | None = None
+            if config.conversation_runtime == "docker":
+                container_manager = ContainerManager(config)
+                api.state.container_manager = container_manager
+                logger.info(
+                    "Docker conversation runtime enabled (image=%s)",
+                    config.conversation_image,
+                )
+
             try:
                 yield
             finally:
+                if container_manager is not None:
+                    await container_manager.shutdown()
                 if retention_task is not None:
                     retention_task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -298,19 +319,27 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
         dependencies.append(Depends(create_session_api_key_dependency(config)))
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
-    api_router.include_router(event_router)
-    api_router.include_router(conversation_router)
-    api_router.include_router(conversation_router_acp)
-    api_router.include_router(tool_router)
-    api_router.include_router(bash_router)
-    api_router.include_router(git_router)
-    api_router.include_router(file_router)
-    api_router.include_router(vscode_router)
-    api_router.include_router(desktop_router)
-    api_router.include_router(skills_router)
-    api_router.include_router(hooks_router)
+
+    if config.conversation_runtime == "docker":
+        # Docker mode: conversation/event/workspace traffic is reverse-proxied
+        # to a per-conversation container. The non-conversation routers
+        # (settings, profiles, workspaces, auth, ...) still run in-process on
+        # the outer server.
+        api_router.include_router(docker_conversation_router)
+    else:
+        api_router.include_router(event_router)
+        api_router.include_router(conversation_router)
+        api_router.include_router(conversation_router_acp)
+        api_router.include_router(tool_router)
+        api_router.include_router(bash_router)
+        api_router.include_router(git_router)
+        api_router.include_router(file_router)
+        api_router.include_router(vscode_router)
+        api_router.include_router(desktop_router)
+        api_router.include_router(skills_router)
+        api_router.include_router(hooks_router)
+        api_router.include_router(mcp_router)
     api_router.include_router(llm_router)
-    api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
     api_router.include_router(profiles_router)
@@ -331,10 +360,16 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
             Depends(create_workspace_session_dependency(config))
         )
     workspace_api_router = APIRouter(prefix="/api", dependencies=workspace_dependencies)
-    workspace_api_router.include_router(workspace_router)
+    if config.conversation_runtime == "local":
+        # In docker mode workspace static files are served by the generic
+        # ``/api/conversations/{cid}/workspace/...`` proxy registered above.
+        workspace_api_router.include_router(workspace_router)
     app.include_router(workspace_api_router)
 
-    app.include_router(sockets_router)
+    if config.conversation_runtime == "docker":
+        app.include_router(docker_sockets_router)
+    else:
+        app.include_router(sockets_router)
 
 
 def _setup_static_files(app: FastAPI, config: Config) -> None:

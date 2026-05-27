@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -212,6 +212,62 @@ class Config(BaseModel):
             "The URL where this agent server instance is available externally"
         ),
     )
+
+    # ---- Docker runtime mode -----------------------------------------------
+    # When ``conversation_runtime == "docker"``, every conversation runs in
+    # its own Docker container hosting another agent-server. This outer
+    # agent-server then acts as a thin reverse proxy in front of the per-
+    # conversation containers. See ``docker_runtime/`` for the implementation.
+    conversation_runtime: Literal["local", "docker"] = Field(
+        default="local",
+        description=(
+            "How to host conversations. ``local`` runs each conversation "
+            "in-process on this server (the default; current behavior). "
+            "``docker`` spawns a fresh Docker container running an "
+            "agent-server image per conversation and proxies "
+            "conversation-scoped HTTP and WebSocket traffic to it."
+        ),
+    )
+    conversation_image: str = Field(
+        default="ghcr.io/openhands/agent-server:latest-python",
+        description=(
+            "Container image used to host each conversation when "
+            "``conversation_runtime == 'docker'``. Ignored otherwise."
+        ),
+    )
+    conversation_container_network: str | None = Field(
+        default=None,
+        description=(
+            "Optional Docker network to attach per-conversation containers to."
+        ),
+    )
+    conversation_container_volumes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional ``-v`` volume mounts to apply to every per-conversation "
+            "container (e.g. ``'/host/cache:/cache'``). Ignored in local mode."
+        ),
+    )
+    conversation_container_forward_env: list[str] = Field(
+        default_factory=lambda: ["DEBUG"],
+        description=(
+            "Environment variable names to forward from this server's "
+            "environment into every per-conversation container."
+        ),
+    )
+    conversation_container_platform: str = Field(
+        default="linux/amd64",
+        description="``--platform`` flag passed to ``docker run``.",
+    )
+    conversation_container_startup_timeout: float = Field(
+        default=120.0,
+        gt=0.0,
+        description=(
+            "Seconds to wait for a freshly-spawned conversation container "
+            "to pass its /health check before giving up."
+        ),
+    )
+
     model_config: ClassVar[ConfigDict] = {"frozen": True}
 
     @property
