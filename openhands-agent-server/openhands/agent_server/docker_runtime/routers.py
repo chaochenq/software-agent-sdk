@@ -33,7 +33,7 @@ from fastapi import (
     WebSocket,
     status,
 )
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from openhands.agent_server.docker_runtime.container_manager import (
     ContainerManager,
@@ -139,7 +139,7 @@ async def docker_start_conversation(
     body["workspace"] = workspace
 
     try:
-        running = await manager.start(conversation_id)
+        running, is_new = await manager.start(conversation_id)
     except DockerUnavailableError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
@@ -167,23 +167,27 @@ async def docker_start_conversation(
             )
     except httpx.HTTPError as exc:
         # If we managed to start the container but the very first request
-        # failed, that's a startup race. Treat as 502 and tear down so we
-        # don't leak a half-initialized container.
+        # failed, that's a startup race. Tear down only the container WE
+        # just created — otherwise a retry against an existing
+        # conversation would kill the live one.
         logger.warning(
             "Initial request to fresh container %s failed: %s",
             running.container_id[:12],
             exc,
         )
-        await manager.stop(conversation_id)
+        if is_new:
+            await manager.stop(conversation_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Conversation container could not accept the request: {exc}",
         ) from exc
 
-    if response.status_code >= 400:
+    if response.status_code >= 400 and is_new:
         # The inner server rejected the create. Don't leave the container
         # behind in that case — it'd be orphaned, since no client will know
-        # to send DELETE.
+        # to send DELETE. But only if we were the ones who started it:
+        # a retried create against an existing conversation must not tear
+        # down the live conversation.
         await manager.stop(conversation_id)
 
     return JSONResponse(
@@ -229,22 +233,74 @@ async def docker_delete_conversation(
     )
 
 
-_FANOUT_LIST_PATHS = {"", "/", "/search", "/count"}
-
-
 @docker_conversation_router.get("/search")
 async def docker_search_conversations(request: Request) -> JSONResponse:
-    return await _fanout_get_aggregate(request, "/api/conversations/search")
+    """Fan-out listing endpoint — preserves the local
+    :class:`ConversationPage` wire shape (``{"items": [...], "next_page_id":
+    null}``). Each inner agent-server has at most one conversation, so we
+    just concatenate the inner ``items`` lists. ``page_id`` / ``limit`` /
+    ``sort_order`` are not honored across containers in this first cut.
+    """
+    return await _fanout_search(request)
 
 
 @docker_conversation_router.get("/count")
-async def docker_count_conversations(request: Request) -> JSONResponse:
+async def docker_count_conversations(request: Request) -> Response:
+    """Fan-out count — preserves the local contract of returning a bare
+    JSON integer (not ``{"count": N}``). Honors the ``?status=`` filter by
+    forwarding it to each container, so containers whose conversation does
+    not match contribute 0.
+    """
     return await _fanout_count(request)
 
 
 @docker_conversation_router.get("")
-async def docker_list_conversations(request: Request) -> JSONResponse:
-    return await _fanout_get_aggregate(request, "/api/conversations")
+async def docker_batch_get_conversations(
+    request: Request,
+    ids: Annotated[list[UUID], Query()],
+    include_skills: Annotated[bool, Query()] = False,
+) -> JSONResponse:
+    """Batch-get conversations by id — preserves the local
+    ``GET /api/conversations?ids=...`` contract (returns
+    ``list[ConversationInfo | None]`` with ``None`` for missing ids).
+
+    Each id is looked up in the container registry; matched ids are
+    fetched from their respective container, mismatched ids slot in as
+    ``None``. ``ids`` is required (same as local mode).
+    """
+    if len(ids) >= 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many ids requested (limit 100).",
+        )
+
+    manager = get_container_manager(request)
+
+    async def _fetch_one(cid: UUID):
+        running = manager.get(cid)
+        if running is None:
+            return None
+        suffix = "?include_skills=true" if include_skills else ""
+        url = f"{running.base_url}/api/conversations/{cid}{suffix}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    url, headers={"X-Session-API-Key": running.session_api_key}
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("Batch-get failed for %s: %s", cid, exc)
+            return None
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            return None
+
+    results = await asyncio.gather(*[_fetch_one(cid) for cid in ids])
+    return JSONResponse(content=list(results), status_code=200)
 
 
 @docker_conversation_router.api_route(
@@ -289,59 +345,62 @@ async def docker_proxy_conversation_subpath(
 
 
 # ---------------------------------------------------------------------------
-# HTTP fan-out helpers (list / search / count)
+# HTTP fan-out helpers (search / count)
 # ---------------------------------------------------------------------------
 
 
-async def _fanout_get_aggregate(request: Request, path: str) -> JSONResponse:
-    """Aggregate ``items`` lists from every container.
+async def _inner_get_json(running: RunningContainer, upstream_path: str):
+    """Issue a GET to one container's inner agent-server and decode JSON.
 
-    Each inner agent-server has at most one conversation, so the inner
-    response always looks like ``{"items": [...], "next_page_id": null}``.
-    We concatenate the items in deterministic order (by container start
-    time, which is the registry insertion order).
+    Returns ``None`` on any failure so the caller can treat that container
+    as contributing nothing to the aggregate.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                running.base_url + upstream_path,
+                headers={"X-Session-API-Key": running.session_api_key},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Fan-out GET %s failed for %s: %s",
+            upstream_path,
+            running.container_id[:12],
+            exc,
+        )
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        return None
 
-    Pagination is intentionally not implemented in this first cut: ``GET
-    /api/conversations`` returns at most ``len(containers)`` rows, which
-    is bounded by however many conversations the operator allows.
+
+async def _fanout_search(request: Request) -> JSONResponse:
+    """Fan-out for ``/api/conversations/search``.
+
+    Returns the same wire shape as :class:`ConversationPage` —
+    ``{"items": [...], "next_page_id": null}``. Each inner server runs at
+    most one conversation, so we just concatenate ``items`` from every
+    container's response.
     """
     manager = get_container_manager(request)
     query = request.url.query
-    upstream_path = f"{path}?{query}" if query else path
-
-    async def _fetch(running: RunningContainer):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    running.base_url + upstream_path,
-                    headers={"X-Session-API-Key": running.session_api_key},
-                )
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "Fan-out GET %s failed for %s: %s",
-                upstream_path,
-                running.container_id[:12],
-                exc,
-            )
-            return None
-        if resp.status_code != 200:
-            return None
-        try:
-            return resp.json()
-        except json.JSONDecodeError:
-            return None
+    upstream_path = (
+        f"/api/conversations/search?{query}" if query else "/api/conversations/search"
+    )
 
     results = await asyncio.gather(
-        *[_fetch(c) for c in manager.list()], return_exceptions=False
+        *[_inner_get_json(c, upstream_path) for c in manager.list()]
     )
 
     aggregated_items: list = []
     for result in results:
-        if not result:
-            continue
-        items = result.get("items")
-        if isinstance(items, list):
-            aggregated_items.extend(items)
+        if isinstance(result, dict):
+            items = result.get("items")
+            if isinstance(items, list):
+                aggregated_items.extend(items)
 
     return JSONResponse(
         content={"items": aggregated_items, "next_page_id": None},
@@ -349,9 +408,66 @@ async def _fanout_get_aggregate(request: Request, path: str) -> JSONResponse:
     )
 
 
-async def _fanout_count(request: Request) -> JSONResponse:
+async def _fanout_count(request: Request) -> Response:
+    """Fan-out for ``/api/conversations/count``.
+
+    The local endpoint returns a bare JSON integer. We forward the same
+    query string (``?status=...``) to every inner container, sum the
+    returned integers, and emit a bare integer.
+    """
     manager = get_container_manager(request)
-    return JSONResponse(content={"count": len(manager.list())}, status_code=200)
+    query = request.url.query
+    upstream_path = (
+        f"/api/conversations/count?{query}" if query else "/api/conversations/count"
+    )
+
+    results = await asyncio.gather(
+        *[_inner_get_json(c, upstream_path) for c in manager.list()]
+    )
+
+    total = 0
+    for result in results:
+        if isinstance(result, int):
+            total += result
+        # Be tolerant of an inner server that ever returns ``{"count": N}``.
+        elif isinstance(result, dict) and isinstance(result.get("count"), int):
+            total += result["count"]
+
+    return Response(content=json.dumps(total), media_type="application/json")
+
+
+# ---------------------------------------------------------------------------
+# Workspace static files — same path as the local workspace_router, but
+# served under the workspace-cookie auth group so that browser iframe /
+# <img> embeds work without the X-Session-API-Key header. Registered
+# BEFORE ``docker_conversation_router``'s catch-all so the more specific
+# workspace path wins. We deliberately do NOT pull in the cookie
+# dependency here — ``api.py`` mounts this router under the existing
+# ``workspace_api_router`` whose dependencies already implement
+# cookie-or-header auth.
+# ---------------------------------------------------------------------------
+
+docker_workspace_router = APIRouter(prefix="/conversations", tags=["Docker Workspace"])
+
+
+@docker_workspace_router.get("/{conversation_id}/workspace/{file_path:path}")
+async def docker_proxy_workspace_file(
+    conversation_id: UUID, file_path: str, request: Request
+) -> StreamingResponse:
+    """Proxy workspace static-file reads to the per-conversation container.
+
+    The local :class:`workspace_router` resolves ``file_path`` against the
+    conversation's working dir on the host. In docker mode the canonical
+    filesystem lives inside the container, so we just hand the request
+    through to the inner server's identical route.
+    """
+    manager = get_container_manager(request)
+    running = _container_or_404(manager, conversation_id)
+    upstream_path = _build_upstream_path(
+        request,
+        f"/api/conversations/{conversation_id}/workspace/{file_path}",
+    )
+    return await proxy_http(request, running, upstream_path=upstream_path)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +478,30 @@ docker_sockets_router = APIRouter(prefix="/sockets", tags=["Docker WebSockets"])
 
 
 @docker_sockets_router.websocket("/events/{conversation_id}")
-async def docker_events_websocket(websocket: WebSocket, conversation_id: UUID) -> None:
+async def docker_events_websocket(
+    websocket: WebSocket,
+    conversation_id: UUID,
+    session_api_key: Annotated[str | None, Query(alias="session_api_key")] = None,
+) -> None:
+    """Authenticated WebSocket bridge to the per-conversation container.
+
+    Auth must succeed against the OUTER server's session keys before we
+    reach the inner container — otherwise a request with no key would be
+    indistinguishable from one the outer server has already authorized,
+    since the bridge re-signs with the container's session key. We reuse
+    :func:`openhands.agent_server.sockets._accept_authenticated_websocket`,
+    which supports the same three auth methods the local sockets router
+    accepts (header / query / first-message ``{"type": "auth", ...}``).
+    On success the helper has already ``accept()``ed the socket, so the
+    downstream bridge must NOT accept again.
+    """
+    # Imported lazily to avoid a circular import: the sockets module pulls
+    # in the in-process conversation service at module scope.
+    from openhands.agent_server.sockets import _accept_authenticated_websocket
+
+    if not await _accept_authenticated_websocket(websocket, session_api_key):
+        return
+
     manager = getattr(websocket.app.state, "container_manager", None)
     if manager is None:
         await websocket.close(code=1011)
@@ -372,7 +511,30 @@ async def docker_events_websocket(websocket: WebSocket, conversation_id: UUID) -
         # 1008 == policy violation; closest standard code for "no such conv".
         await websocket.close(code=1008)
         return
+
+    # Strip the auth query param before forwarding upstream — the inner
+    # server is reached via the container session key (in the header),
+    # never the outer-facing one.
     upstream_path = f"/sockets/events/{conversation_id}"
-    if websocket.url.query:
-        upstream_path = f"{upstream_path}?{websocket.url.query}"
+    forwarded_query = _strip_auth_query(websocket.url.query)
+    if forwarded_query:
+        upstream_path = f"{upstream_path}?{forwarded_query}"
     await bridge_websocket(websocket, running, upstream_path=upstream_path)
+
+
+def _strip_auth_query(query: str) -> str:
+    """Remove ``session_api_key`` from a urlencoded query string.
+
+    The outer server's session key must never leak into the inner
+    container's logs or request history.
+    """
+    if not query:
+        return ""
+    from urllib.parse import parse_qsl, urlencode
+
+    keep = [
+        (k, v)
+        for k, v in parse_qsl(query, keep_blank_values=True)
+        if k != "session_api_key"
+    ]
+    return urlencode(keep)

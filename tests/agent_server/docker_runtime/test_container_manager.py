@@ -111,8 +111,9 @@ async def test_start_invokes_docker_run_and_waits_for_health(monkeypatch):
         )
 
         cid = uuid4()
-        running = await manager.start(cid)
+        running, is_new = await manager.start(cid)
 
+        assert is_new is True
         assert running.conversation_id == cid
         assert running.container_id == "abcdef1234567890"
         assert running.host_port == port
@@ -122,7 +123,9 @@ async def test_start_invokes_docker_run_and_waits_for_health(monkeypatch):
         run_argv = next(call for call in run.calls if call[1] == "run")
         assert "-p" in run_argv
         port_arg_index = run_argv.index("-p") + 1
-        assert run_argv[port_arg_index] == f"{port}:8000"
+        # Inner container ports MUST be bound only to loopback so the only
+        # path to them is via the outer agent-server's authenticated proxy.
+        assert run_argv[port_arg_index] == f"127.0.0.1:{port}:8000"
         assert "ghcr.io/openhands/agent-server:test" in run_argv
         # Session key got injected via env so the inner server requires it.
         env_args = [run_argv[i + 1] for i, arg in enumerate(run_argv) if arg == "-e"]
@@ -149,9 +152,13 @@ async def test_start_is_idempotent_per_conversation_id(monkeypatch):
             _docker_config(), run_command=run, sleep=lambda _s: None
         )
         cid = uuid4()
-        first = await manager.start(cid)
-        second = await manager.start(cid)
+        first, first_new = await manager.start(cid)
+        second, second_new = await manager.start(cid)
         assert first is second
+        assert first_new is True
+        # Second call reused the existing container; callers depend on this
+        # ``False`` to skip teardown after a retried-create failure.
+        assert second_new is False
         # Only one ``docker run`` was issued.
         assert sum(1 for c in run.calls if c[1] == "run") == 1
 

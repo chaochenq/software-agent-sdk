@@ -151,6 +151,11 @@ async def bridge_websocket(
     (the agent-server's WebSocket auth also accepts that header — see
     :mod:`openhands.agent_server.sockets`).
 
+    Precondition: ``client_ws`` MUST already be accepted by the caller. The
+    bridge does not call ``accept()`` itself because the outer server's
+    WebSocket-auth helper (which accepts on success) needs to run first.
+    Calling ``accept()`` a second time would raise.
+
     Closure semantics: when either side closes (or errors), we close the
     other side and return. We do not attempt to reconnect.
     """
@@ -158,8 +163,6 @@ async def bridge_websocket(
         running.base_url.replace("http://", "ws://").replace("https://", "wss://")
         + upstream_path
     )
-
-    await client_ws.accept()
 
     extra_headers = {"X-Session-API-Key": running.session_api_key}
 

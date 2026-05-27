@@ -38,6 +38,7 @@ from openhands.agent_server.docker_runtime.container_manager import ContainerMan
 from openhands.agent_server.docker_runtime.routers import (
     docker_conversation_router,
     docker_sockets_router,
+    docker_workspace_router,
 )
 from openhands.agent_server.event_router import event_router
 from openhands.agent_server.file_router import file_router
@@ -347,7 +348,6 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     # /api/auth/* mints workspace cookies and requires the header to bootstrap,
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)
-    app.include_router(api_router)
 
     # Workspace static-file routes get their own auth group that accepts
     # EITHER the X-Session-API-Key header OR the workspace session cookie.
@@ -360,11 +360,21 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
             Depends(create_workspace_session_dependency(config))
         )
     workspace_api_router = APIRouter(prefix="/api", dependencies=workspace_dependencies)
-    if config.conversation_runtime == "local":
-        # In docker mode workspace static files are served by the generic
-        # ``/api/conversations/{cid}/workspace/...`` proxy registered above.
+    if config.conversation_runtime == "docker":
+        # Proxy workspace static files via the per-conversation container,
+        # but under the workspace-cookie auth group so iframe/img embeds work.
+        workspace_api_router.include_router(docker_workspace_router)
+    else:
         workspace_api_router.include_router(workspace_router)
+
+    # Order matters: the workspace router is more specific
+    # (``/conversations/{cid}/workspace/...``) than the docker catch-all
+    # (``/conversations/{cid}/{tail:path}``). Starlette matches in
+    # registration order, so we MUST include the cookie-auth workspace
+    # router before the header-auth api_router; otherwise the catch-all
+    # would shadow workspace requests and demand the header.
     app.include_router(workspace_api_router)
+    app.include_router(api_router)
 
     if config.conversation_runtime == "docker":
         app.include_router(docker_sockets_router)

@@ -131,21 +131,28 @@ class ContainerManager:
     def get(self, conversation_id: UUID) -> RunningContainer | None:
         return self._containers.get(conversation_id)
 
-    async def start(self, conversation_id: UUID) -> RunningContainer:
+    async def start(self, conversation_id: UUID) -> tuple[RunningContainer, bool]:
         """Spawn a fresh container for ``conversation_id``.
 
         Idempotent: if a container is already registered for this conversation
         the existing :class:`RunningContainer` is returned and no new
         container is started.
+
+        Returns:
+            ``(running, is_new)``: ``is_new`` is ``True`` when this call
+            actually spawned a new container, and ``False`` when an existing
+            registered container was returned. Callers that want to clean
+            up after a failed startup MUST gate the teardown on ``is_new``
+            so retried requests don't tear down a live conversation.
         """
         async with self._lock:
             existing = self._containers.get(conversation_id)
             if existing is not None:
-                return existing
+                return existing, False
 
             running = await asyncio.to_thread(self._start_blocking, conversation_id)
             self._containers[conversation_id] = running
-            return running
+            return running, True
 
     async def stop(self, conversation_id: UUID) -> bool:
         """Stop and forget the container for ``conversation_id``.
@@ -211,7 +218,11 @@ class ContainerManager:
             "--name",
             container_name,
             "-p",
-            f"{host_port}:8000",
+            # Bind only to loopback. The outer agent-server reaches the
+            # inner one via 127.0.0.1; exposing it on all host interfaces
+            # would bypass the outer auth and turn every per-conversation
+            # container into a publicly addressable agent-server.
+            f"127.0.0.1:{host_port}:8000",
             *flags,
             image,
             "--host",
