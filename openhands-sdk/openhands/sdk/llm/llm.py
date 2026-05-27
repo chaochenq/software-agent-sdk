@@ -94,6 +94,7 @@ from openhands.sdk.llm.exceptions import (
 from openhands.sdk.llm.llm_response import LLMResponse
 from openhands.sdk.llm.message import (
     Message,
+    TextContent,
 )
 from openhands.sdk.llm.mixins.non_native_fc import NonNativeToolCallingMixin
 from openhands.sdk.llm.options.chat_options import select_chat_options
@@ -1242,6 +1243,87 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     _fb_token,
                 ),
             )
+
+    # =========================================================================
+    # Verify (credentials/connectivity probe)
+    # =========================================================================
+    def verify(self) -> None:
+        """Send a minimal one-token completion to confirm credentials work.
+
+        ``verify`` deliberately bypasses both the retry decorator and the
+        :attr:`fallback_strategy` so the *first* real provider error is
+        surfaced as a typed SDK exception via :func:`map_provider_exception`.
+        Retrying or falling back on verify would either delay an inevitable
+        auth failure or test a different model than the user intends to save.
+
+        Returns:
+            ``None`` on success.
+
+        Raises:
+            LLMAuthenticationError: Provider rejected the credentials.
+            LLMRateLimitError: Provider returned a rate-limit error.
+                Credentials are still valid; callers may treat this as a soft
+                success.
+            LLMTimeoutError: Request timed out before a response arrived.
+            LLMServiceUnavailableError: Network/DNS error, 5xx, or other
+                transient provider unavailability.
+            LLMBadRequestError: Provider rejected the request with a 4xx that
+                is not an auth or rate-limit error (for example an unknown
+                model name). Credentials are valid but the config is wrong.
+            Exception: Any other provider error not handled by
+                :func:`map_provider_exception` is re-raised unchanged.
+        """
+        formatted_messages, call_kwargs = self._prepare_verify_call()
+        try:
+            self._transport_call(messages=formatted_messages, **call_kwargs)
+        except Exception as exc:
+            mapped = map_provider_exception(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise
+
+    async def averify(self) -> None:
+        """Async variant of :meth:`verify`.
+
+        Uses :meth:`_atransport_call` so the event loop is not blocked while
+        the probe request is in flight. Same return/exception contract as
+        the sync method.
+        """
+        formatted_messages, call_kwargs = self._prepare_verify_call()
+        try:
+            await self._atransport_call(messages=formatted_messages, **call_kwargs)
+        except Exception as exc:
+            mapped = map_provider_exception(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise
+
+    def _prepare_verify_call(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build the formatted messages and call kwargs for a verify probe.
+
+        Reuses :meth:`_prepare_completion_params` so verify exercises the same
+        provider-aware option normalization (Azure ``max_tokens`` rename,
+        OpenRouter headers, extended-thinking budgets, etc.) as a real
+        completion. ``max_completion_tokens=1`` caps output across providers;
+        the Azure branch of :func:`select_chat_options` renames it to
+        ``max_tokens=1`` automatically.
+        """
+        probe = [Message(role="user", content=[TextContent(text="hi")])]
+        (
+            formatted_messages,
+            _cc_tools,
+            _use_mock_tools,
+            call_kwargs,
+            _telemetry_ctx,
+        ) = self._prepare_completion_params(
+            probe,
+            tools=None,
+            add_security_risk_prediction=False,
+            kwargs={"max_completion_tokens": 1},
+        )
+        return formatted_messages, call_kwargs
 
     # =========================================================================
     # Responses API (v1)
