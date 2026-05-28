@@ -6,6 +6,8 @@ Verifies that 422 error responses do not leak sensitive fields such as
 Refs: OpenHands/evaluation#385
 """
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -168,6 +170,35 @@ class TestSanitizeValidationErrors:
     def test_empty_errors_list(self):
         """An empty error list should return an empty list."""
         assert _sanitize_validation_errors([]) == []
+
+    def test_non_json_serializable_ctx_is_encoded(self):
+        """Pydantic surfaces the original exception under ``ctx['error']`` for
+        ``value_error`` types raised from ``@model_validator`` hooks. That
+        object is not JSON-serializable, so the sanitizer must run the result
+        through ``jsonable_encoder`` or the 422 handler itself will 500.
+
+        Regression test for the crash hit by ``POST /llm/verify`` when the
+        request body omits ``model`` and ``LLM._coerce_inputs`` raises.
+        """
+        errors = [
+            {
+                "type": "value_error",
+                "loc": ("body",),
+                "msg": "Value error, model must be specified in LLM",
+                "input": {"api_key": "sk-real-secret-key-12345"},
+                "ctx": {"error": ValueError("model must be specified in LLM")},
+            }
+        ]
+        result = _sanitize_validation_errors(errors)
+
+        # The contract the FastAPI exception handler depends on: the result
+        # must be round-trippable through ``json.dumps``. The human-readable
+        # message stays on the top-level ``msg`` field; ``ctx['error']``
+        # collapses to whatever ``jsonable_encoder`` can produce, which is
+        # acceptable as long as it doesn't crash the response.
+        json.dumps(result)
+        assert result[0]["input"]["api_key"] == "<redacted>"
+        assert "model must be specified" in result[0]["msg"]
 
 
 # ---------------------------------------------------------------------------

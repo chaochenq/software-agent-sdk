@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
@@ -217,10 +218,10 @@ def test_verify_endpoint_missing_model_returns_422(client):
 
 
 def test_verify_endpoint_ignores_extra_fields(client):
-    """``model_config = ConfigDict(extra='ignore')`` on ``VerifyLLMRequest``
-    means extra fields in the body don't 422 — they're silently dropped.
-    Keeps the contract forward-compatible as the UI sends additional LLM
-    fields over time."""
+    """``LLM`` is declared with ``extra='ignore'``, so unknown fields in the
+    request body are silently dropped rather than rejected. Keeps the
+    contract forward-compatible if a client sends keys the SDK doesn't know
+    about yet."""
     with patch.object(LLM, "averify", new_callable=AsyncMock) as averify:
         averify.return_value = None
         response = client.post(
@@ -242,13 +243,8 @@ def test_verify_endpoint_forwards_api_key_unmasked(client):
     async def _capture(self):
         # ``self`` is the constructed LLM. Pull the secret value out so we can
         # assert on it after the request returns.
-        assert self.api_key is not None
-        from pydantic import SecretStr
-
-        if isinstance(self.api_key, SecretStr):
-            captured["api_key"] = self.api_key.get_secret_value()
-        else:
-            captured["api_key"] = str(self.api_key)
+        assert isinstance(self.api_key, SecretStr)
+        captured["api_key"] = self.api_key.get_secret_value()
         return None
 
     with patch.object(LLM, "averify", _capture):
@@ -258,6 +254,41 @@ def test_verify_endpoint_forwards_api_key_unmasked(client):
 
     assert response.status_code == 200
     assert captured["api_key"] == "sk-secret-123"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ],
+)
+def test_verify_endpoint_forwards_aws_secret_fields_unmasked(client, field):
+    """AWS credential fields are ``SecretStr``-typed on ``LLM`` and share the
+    same masking risk as ``api_key``. Asserts each one reaches the LLM
+    instance with its raw value intact so a Bedrock verify probe doesn't
+    fail with a misleading auth error."""
+    captured: dict[str, str] = {}
+
+    async def _capture(self):
+        value = getattr(self, field)
+        assert isinstance(value, SecretStr)
+        captured[field] = value.get_secret_value()
+        return None
+
+    with patch.object(LLM, "averify", _capture):
+        response = client.post(
+            "/api/llm/verify",
+            json={
+                "model": "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+                "aws_region_name": "us-east-1",
+                field: "aws-secret-value",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured[field] == "aws-secret-value"
 
 
 def test_verify_endpoint_keyless_local_server(client):
