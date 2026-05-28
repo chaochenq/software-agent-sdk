@@ -237,7 +237,7 @@ async def verify_llm_config(llm: LLM) -> VerifyLLMResponse:
         await asyncio.wait_for(llm.averify(), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — verify must never raise
         result = _verify_response_for_exception(exc, llm)
-        if result.provider is None:
+        if result.provider is None and provider is not None:
             result = result.model_copy(update={"provider": provider})
         return result
     return VerifyLLMResponse(status=VerifyLLMStatus.SUCCESS, provider=provider)
