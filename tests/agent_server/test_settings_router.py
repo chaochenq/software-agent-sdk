@@ -905,3 +905,163 @@ def test_delete_secret_corrupted_file_returns_500(
     response = client_with_settings.delete("/api/settings/secrets/MY_SECRET")
 
     assert response.status_code == 500
+
+
+# ── ACP env-var CRUD tests ──────────────────────────────────────────────
+
+
+def _seed_acp_agent_settings(
+    client_with_settings, *, acp_env: dict[str, str] | None = None
+) -> None:
+    """Switch the persisted agent to an ACP agent for env-var tests."""
+    diff: dict[str, object] = {
+        "agent_kind": "acp",
+        "acp_server": "claude-code",
+        "acp_command": [],
+    }
+    if acp_env is not None:
+        diff["acp_env"] = acp_env
+    response = client_with_settings.patch(
+        "/api/settings", json={"agent_settings_diff": diff}
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_list_acp_env_vars_empty(client_with_settings):
+    """GET /agent-env on an ACP agent with no env vars returns an empty list."""
+    _seed_acp_agent_settings(client_with_settings)
+    response = client_with_settings.get("/api/settings/agent-env")
+    assert response.status_code == 200
+    assert response.json() == {"env_vars": []}
+
+
+def test_list_acp_env_vars_non_acp_returns_empty(client_with_settings):
+    """GET /agent-env on a non-ACP agent returns an empty list (not 409).
+
+    The UI may poll this endpoint regardless of agent kind; a 409 here would
+    surface as an error toast even when the env-vars panel is hidden.
+    """
+    response = client_with_settings.get("/api/settings/agent-env")
+    assert response.status_code == 200
+    assert response.json() == {"env_vars": []}
+
+
+def test_upsert_acp_env_var_creates_then_lists(client_with_settings):
+    """PUT /agent-env creates an entry; GET lists it (names only)."""
+    _seed_acp_agent_settings(client_with_settings)
+
+    create = client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "ANTHROPIC_API_KEY", "value": "sk-ant"},
+    )
+    assert create.status_code == 200, create.text
+    assert create.json() == {"name": "ANTHROPIC_API_KEY"}
+    # Response shape excludes the value.
+    assert "value" not in create.json()
+
+    listing = client_with_settings.get("/api/settings/agent-env")
+    assert listing.status_code == 200
+    assert listing.json() == {"env_vars": [{"name": "ANTHROPIC_API_KEY"}]}
+
+
+def test_upsert_acp_env_var_replaces_existing_value(
+    client_with_settings, temp_persistence_dir, secret_key
+):
+    """A second PUT with the same name overwrites the value on disk."""
+    _seed_acp_agent_settings(client_with_settings)
+    cipher = Cipher(secret_key)
+
+    client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "ANTHROPIC_API_KEY", "value": "sk-original"},
+    )
+    client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "ANTHROPIC_API_KEY", "value": "sk-rotated"},
+    )
+
+    # Verify via the store that the value on disk is the rotated one.
+    store = FileSettingsStore(persistence_dir=temp_persistence_dir, cipher=cipher)
+    settings = store.load()
+    assert settings is not None
+    assert isinstance(settings.agent_settings, ACPAgentSettings)
+    assert settings.agent_settings.acp_env == {"ANTHROPIC_API_KEY": "sk-rotated"}
+
+
+def test_upsert_acp_env_var_persists_encrypted_on_disk(
+    client_with_settings, temp_persistence_dir
+):
+    """The value must be encrypted at rest (Fernet ciphertext, not plaintext)."""
+    _seed_acp_agent_settings(client_with_settings)
+    client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "ANTHROPIC_API_KEY", "value": "sk-roundtrip"},
+    )
+
+    on_disk_text = (temp_persistence_dir / "settings.json").read_text()
+    assert "sk-roundtrip" not in on_disk_text
+    on_disk = json.loads(on_disk_text)
+    stored = on_disk["agent_settings"]["acp_env"]["ANTHROPIC_API_KEY"]
+    assert stored.startswith("gAAAA")
+
+
+def test_delete_acp_env_var_removes_key(client_with_settings):
+    """DELETE removes the key; subsequent list shows siblings only."""
+    _seed_acp_agent_settings(client_with_settings)
+    client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "KEEP_ME", "value": "x"},
+    )
+    client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "DROP_ME", "value": "y"},
+    )
+
+    response = client_with_settings.delete("/api/settings/agent-env/DROP_ME")
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+
+    listing = client_with_settings.get("/api/settings/agent-env")
+    assert listing.status_code == 200
+    assert listing.json() == {"env_vars": [{"name": "KEEP_ME"}]}
+
+
+def test_delete_acp_env_var_missing_returns_404(client_with_settings):
+    """DELETE on a name that isn't there returns 404, not a 200 no-op."""
+    _seed_acp_agent_settings(client_with_settings)
+    response = client_with_settings.delete("/api/settings/agent-env/NOPE")
+    assert response.status_code == 404
+
+
+def test_upsert_acp_env_var_invalid_name_returns_422(client_with_settings):
+    """Names that don't match SECRET_NAME_PATTERN are rejected at the boundary."""
+    _seed_acp_agent_settings(client_with_settings)
+    response = client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "1bad-name", "value": "x"},
+    )
+    assert response.status_code == 422
+
+
+def test_delete_acp_env_var_invalid_name_returns_422(client_with_settings):
+    response = client_with_settings.delete(
+        "/api/settings/agent-env/1bad-name"
+    )
+    assert response.status_code == 422
+
+
+def test_upsert_acp_env_var_on_non_acp_agent_returns_409(client_with_settings):
+    """The default OpenHands agent has no acp_env field — fail loudly, don't
+    silently coerce into the OpenHands schema where the field would vanish."""
+    response = client_with_settings.put(
+        "/api/settings/agent-env",
+        json={"name": "ANTHROPIC_API_KEY", "value": "sk-x"},
+    )
+    assert response.status_code == 409
+
+
+def test_delete_acp_env_var_on_non_acp_agent_returns_409(client_with_settings):
+    response = client_with_settings.delete(
+        "/api/settings/agent-env/ANTHROPIC_API_KEY"
+    )
+    assert response.status_code == 409

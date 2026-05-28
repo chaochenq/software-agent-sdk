@@ -124,3 +124,45 @@ class SecretCreateRequest(BaseModel):
     name: str
     value: SecretStr
     description: str | None = None
+
+
+# ── ACP env-var API Models ─────────────────────────────────────────────────
+#
+# ``acp_env`` is a ``dict[str, str]`` field on ``ACPAgentSettings`` that maps
+# environment variable names to values injected into the ACP subprocess at
+# spawn time. It is conceptually a small, agent-scoped secret store — and is
+# best managed through a dedicated CRUD surface so that single-key adds and
+# deletes don't have to thread through ``PATCH /api/settings``'s deep-merge
+# semantics, which have no "unset" primitive.
+#
+# These models mirror the secrets API shape on purpose: clients that already
+# know how to talk to ``/api/settings/secrets`` can lift the same hook code
+# almost verbatim.
+
+
+class AcpEnvVarItem(BaseModel):
+    """One ACP env-var entry, without its value.
+
+    Returned in list responses and from upsert. Values are intentionally
+    not surfaced — the dedicated ``GET /agent-env/{name}`` endpoint exists
+    if a backend client needs to round-trip the plaintext value.
+    """
+
+    name: str
+
+
+class AcpEnvVarsListResponse(BaseModel):
+    """Response model for GET /api/settings/agent-env."""
+
+    env_vars: list[AcpEnvVarItem]
+
+
+class AcpEnvVarUpsertRequest(BaseModel):
+    """Request model for PUT /api/settings/agent-env.
+
+    Creates or replaces the value bound to ``name``. The same shape is
+    used for both first-time adds and value rotations.
+    """
+
+    name: str
+    value: SecretStr

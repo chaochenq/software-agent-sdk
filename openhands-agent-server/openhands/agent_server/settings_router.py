@@ -19,6 +19,9 @@ from openhands.agent_server.persistence import (
 from openhands.agent_server.persistence.models import SettingsUpdatePayload
 from openhands.sdk.logger import get_logger
 from openhands.sdk.settings import (
+    AcpEnvVarItem,
+    AcpEnvVarsListResponse,
+    AcpEnvVarUpsertRequest,
     ConversationSettings,
     SecretCreateRequest,
     SecretItemResponse,
@@ -28,6 +31,7 @@ from openhands.sdk.settings import (
     SettingsUpdateRequest,
     export_agent_settings_schema,
 )
+from openhands.sdk.settings.model import ACPAgentSettings
 
 
 logger = get_logger(__name__)
@@ -41,6 +45,8 @@ logger = get_logger(__name__)
 SETTINGS_PATH = ""  # -> /api/settings
 SECRETS_PATH = "/secrets"  # -> /api/settings/secrets
 SECRET_VALUE_PATH = "/secrets/{name}"  # -> /api/settings/secrets/{name}
+ACP_ENV_PATH = "/agent-env"  # -> /api/settings/agent-env
+ACP_ENV_VALUE_PATH = "/agent-env/{name}"  # -> /api/settings/agent-env/{name}
 
 settings_router = APIRouter(prefix="/settings", tags=["Settings"])
 
@@ -383,5 +389,173 @@ async def delete_secret(request: Request, name: str) -> dict[str, bool]:
     logger.info(
         "Secret deleted",
         extra={"secret_name": name, "client_host": client_host},
+    )
+    return {"deleted": True}
+
+
+# ── ACP env-var CRUD Endpoints ───────────────────────────────────────────
+#
+# ``acp_env`` is a ``dict[str, str]`` field on ``ACPAgentSettings`` that
+# injects environment variables into the ACP subprocess at spawn time.
+# Mirrors the secrets API so single-key adds and deletes don't have to
+# thread through ``PATCH /api/settings``'s deep-merge (which has no
+# "unset" primitive). Storage stays inside ``agent_settings`` — only the
+# wire-level mutation shape is different.
+
+
+def _require_acp_agent_settings(
+    settings: PersistedSettings,
+) -> ACPAgentSettings:
+    """Return ``settings.agent_settings`` if it's an ACP variant, else 409.
+
+    The ``acp_env`` field only exists on the ACP discriminated-union
+    variant. Mutating it when the active agent is OpenHands would either
+    be silently dropped on save (the union picks the OpenHands schema) or
+    fail validation — the dedicated 409 is clearer.
+    """
+    agent_settings = settings.agent_settings
+    if not isinstance(agent_settings, ACPAgentSettings):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "ACP env-vars are only available when ``agent_settings.agent_kind`` "
+                "is ``'acp'``. Switch to an ACP agent before managing env-vars."
+            ),
+        )
+    return agent_settings
+
+
+@settings_router.get(ACP_ENV_PATH, response_model=AcpEnvVarsListResponse)
+async def list_acp_env_vars(request: Request) -> AcpEnvVarsListResponse:
+    """List the names of every ACP env-var configured for this agent.
+
+    Values are intentionally not surfaced — callers that need to round-trip
+    a plaintext value should use ``GET /api/settings`` with an
+    ``X-Expose-Secrets`` header, since that path already understands the
+    cipher and serialization context.
+
+    Returns an empty list when the active agent isn't ACP; the GUI treats
+    the absence of variables and the absence of an ACP agent the same way
+    (the env-vars panel is only rendered on the ACP branch).
+    """
+    config = get_config(request)
+    store = get_settings_store(config)
+    settings = store.load() or PersistedSettings()
+
+    client_host = request.client.host if request.client else "unknown"
+    agent_settings = settings.agent_settings
+    if not isinstance(agent_settings, ACPAgentSettings):
+        logger.info(
+            "ACP env-vars list accessed (non-ACP agent)",
+            extra={"client_host": client_host, "env_var_count": 0},
+        )
+        return AcpEnvVarsListResponse(env_vars=[])
+
+    names = sorted(agent_settings.acp_env.keys())
+    logger.info(
+        "ACP env-vars list accessed",
+        extra={"client_host": client_host, "env_var_count": len(names)},
+    )
+    return AcpEnvVarsListResponse(
+        env_vars=[AcpEnvVarItem(name=name) for name in names]
+    )
+
+
+@settings_router.put(ACP_ENV_PATH, response_model=AcpEnvVarItem)
+async def upsert_acp_env_var(
+    request: Request, body: AcpEnvVarUpsertRequest
+) -> AcpEnvVarItem:
+    """Create or replace an ACP env-var.
+
+    Same shape is used for first-time adds and value rotations — the
+    server-side mutation is an unconditional dict assignment under the
+    store's file lock.
+
+    Raises:
+        HTTPException: 422 if name format is invalid, 409 if the active
+        agent isn't ACP, 500 on file I/O failures.
+    """
+    _validate_secret_name(body.name)
+
+    config = get_config(request)
+    store = get_settings_store(config)
+    client_host = request.client.host if request.client else "unknown"
+
+    def apply(settings: PersistedSettings) -> PersistedSettings:
+        agent_settings = _require_acp_agent_settings(settings)
+        # ``acp_env: dict[str, str]`` — assign a fresh dict so Pydantic
+        # treats this as an explicit field set (no in-place mutation
+        # subtleties around model validation on re-save).
+        agent_settings.acp_env = {
+            **agent_settings.acp_env,
+            body.name: body.value.get_secret_value(),
+        }
+        return settings
+
+    try:
+        store.update(apply)
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        logger.error(f"ACP env-var upsert blocked: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Settings file is corrupted or encrypted with a different key",
+        )
+    except (OSError, PermissionError):
+        # exc_info omitted to keep secret values out of tracebacks.
+        logger.error("Failed to upsert ACP env-var - file I/O error")
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+
+    logger.info(
+        "ACP env-var upserted",
+        extra={"env_var_name": body.name, "client_host": client_host},
+    )
+    return AcpEnvVarItem(name=body.name)
+
+
+@settings_router.delete(ACP_ENV_VALUE_PATH)
+async def delete_acp_env_var(request: Request, name: str) -> dict[str, bool]:
+    """Delete a single ACP env-var by name.
+
+    Raises:
+        HTTPException: 422 if name format is invalid, 404 if the var
+        doesn't exist, 409 if the active agent isn't ACP, 500 on file
+        I/O failures.
+    """
+    _validate_secret_name(name)
+
+    config = get_config(request)
+    store = get_settings_store(config)
+    client_host = request.client.host if request.client else "unknown"
+
+    def apply(settings: PersistedSettings) -> PersistedSettings:
+        agent_settings = _require_acp_agent_settings(settings)
+        if name not in agent_settings.acp_env:
+            # Generic 404 message — symmetric with the secrets endpoints,
+            # which avoid leaking which exact names exist.
+            raise HTTPException(status_code=404, detail="ACP env-var not found")
+        agent_settings.acp_env = {
+            k: v for k, v in agent_settings.acp_env.items() if k != name
+        }
+        return settings
+
+    try:
+        store.update(apply)
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        logger.error(f"ACP env-var delete blocked: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Settings file is corrupted or encrypted with a different key",
+        )
+    except (OSError, PermissionError):
+        logger.error("Failed to delete ACP env-var - file I/O error")
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+
+    logger.info(
+        "ACP env-var deleted",
+        extra={"env_var_name": name, "client_host": client_host},
     )
     return {"deleted": True}

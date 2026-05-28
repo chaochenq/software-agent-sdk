@@ -11,6 +11,9 @@ from .acp_providers import (
     get_acp_provider,
 )
 from .api_models import (
+    AcpEnvVarItem,
+    AcpEnvVarsListResponse,
+    AcpEnvVarUpsertRequest,
     SecretCreateRequest,
     SecretItemResponse,
     SecretsListResponse,
@@ -80,6 +83,9 @@ __all__ = [
     "AGENT_SETTINGS_SCHEMA_VERSION",
     "CONVERSATION_SETTINGS_SCHEMA_VERSION",
     "ACPAgentSettings",
+    "AcpEnvVarItem",
+    "AcpEnvVarsListResponse",
+    "AcpEnvVarUpsertRequest",
     "AgentKind",
     "AgentSettingsBase",
     "AgentSettingsConfig",
