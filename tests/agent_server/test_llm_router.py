@@ -387,3 +387,30 @@ def test_verify_endpoint_truncates_pathological_error_messages(client):
     # 512-char cap including the ``…`` ellipsis sentinel.
     assert len(data["message"]) == 512
     assert data["message"].endswith("…")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["aws_access_key_id", "aws_secret_access_key", "aws_session_token"],
+)
+def test_verify_endpoint_scrubs_aws_secret_from_error_message(client, field):
+    """If a provider echoes an AWS credential back in its error body, the value
+    must be scrubbed before it crosses the API boundary — same risk as api_key."""
+    secret = "AKIA-LEAKY-SECRET-VALUE"
+    leak = f"Could not sign request: invalid {field} '{secret}' for endpoint"
+
+    with patch.object(LLM, "averify", new_callable=AsyncMock) as averify:
+        averify.side_effect = LLMAuthenticationError(leak)
+        response = client.post(
+            "/api/llm/verify",
+            json={
+                "model": "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+                "aws_region_name": "us-east-1",
+                field: secret,
+            },
+        )
+
+    data = response.json()
+    assert data["status"] == "auth_error"
+    assert secret not in data["message"]
+    assert "***" in data["message"]

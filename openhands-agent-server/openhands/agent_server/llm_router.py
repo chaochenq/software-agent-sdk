@@ -14,6 +14,7 @@ from openhands.sdk.llm.exceptions import (
     LLMServiceUnavailableError,
     LLMTimeoutError,
 )
+from openhands.sdk.llm.llm import LLM_SECRET_FIELDS
 from openhands.sdk.llm.utils.litellm_provider import infer_litellm_provider
 from openhands.sdk.llm.utils.unverified_models import (
     _extract_model_and_provider,
@@ -165,12 +166,7 @@ def _sanitize_error_message(exc: Exception, llm: LLM) -> str:
        We truncate to ``_MAX_ERROR_MESSAGE_CHARS``.
     """
     message = str(exc)
-    for field_name in (
-        "api_key",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "aws_session_token",
-    ):
+    for field_name in LLM_SECRET_FIELDS:
         value = getattr(llm, field_name, None)
         if isinstance(value, SecretStr):
             raw = value.get_secret_value()
@@ -231,9 +227,10 @@ async def verify_llm_config(llm: LLM) -> VerifyLLMResponse:
     so an unresponsive provider can't park an interactive UI on the SDK's
     300 s default. A timeout is reported as ``status=TIMEOUT``.
     """
-    provider = infer_litellm_provider(model=llm.model, api_base=llm.base_url)
+    provider = None
     timeout = min(llm.timeout or _VERIFY_TIMEOUT_S, _VERIFY_TIMEOUT_S)
     try:
+        provider = infer_litellm_provider(model=llm.model, api_base=llm.base_url)
         await asyncio.wait_for(llm.averify(), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — verify must never raise
         result = _verify_response_for_exception(exc, llm)
