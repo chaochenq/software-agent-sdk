@@ -1,9 +1,10 @@
 """Router for LLM model and provider information endpoints."""
 
+import asyncio
 from enum import Enum
 
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.exceptions import (
@@ -26,6 +27,20 @@ from openhands.sdk.logger import get_logger
 logger = get_logger(__name__)
 
 llm_router = APIRouter(prefix="/llm", tags=["LLM"])
+
+# Hard ceiling for the verify probe so an unresponsive provider can't park a
+# UI "Verify credentials" button on a 5-minute hang (the SDK's
+# ``LLM.timeout`` default). Callers can shorten this by setting
+# ``timeout`` to a smaller value in the request body; we take the
+# ``min`` so they can never extend it past what is a reasonable
+# interactive wait.
+_VERIFY_TIMEOUT_S = 30.0
+
+# Maximum number of characters of provider-side error text we forward to the
+# client. Caps any accidental large payload (truncated HTML error pages,
+# verbose stack traces, etc.) and bounds the worst case if a provider were
+# ever to echo request content back in an error body.
+_MAX_ERROR_MESSAGE_CHARS = 512
 
 
 class ProvidersResponse(BaseModel):
@@ -134,26 +149,62 @@ class VerifyLLMResponse(BaseModel):
     )
 
 
-def _verify_response_for_exception(exc: Exception) -> VerifyLLMResponse:
+def _sanitize_error_message(exc: Exception, llm: LLM) -> str:
+    """Render a provider exception as a client-safe message string.
+
+    Defends against two failure modes:
+
+    1. **Credential leakage**: some providers echo fragments of the request
+       (including ``Authorization`` headers or query-string keys) back in
+       their error bodies. LiteLLM normally surfaces these as the
+       exception's ``str()``. We scrub any of the ``SecretStr`` values that
+       appear on the ``LLM`` instance so a leaked echo collapses to
+       ``***`` before crossing the API boundary.
+    2. **Pathological size**: an HTML error page or large JSON blob in
+       ``str(exc)`` would otherwise flow straight into the JSON response.
+       We truncate to ``_MAX_ERROR_MESSAGE_CHARS``.
+    """
+    message = str(exc)
+    for field_name in (
+        "api_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ):
+        value = getattr(llm, field_name, None)
+        if isinstance(value, SecretStr):
+            raw = value.get_secret_value()
+            # Only redact non-trivial values — replacing the empty string
+            # would corrupt every character boundary in the message.
+            if raw:
+                message = message.replace(raw, "***")
+    if len(message) > _MAX_ERROR_MESSAGE_CHARS:
+        message = message[: _MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+    return message
+
+
+def _verify_response_for_exception(exc: Exception, llm: LLM) -> VerifyLLMResponse:
     """Map a verify-time exception to the appropriate response.
 
     Handled error classes correspond to the typed exceptions raised by
-    :meth:`LLM.verify`; anything else collapses to ``UNKNOWN_ERROR`` so the
-    endpoint never raises and the frontend always has a structured result to
-    branch on.
+    :meth:`LLM.verify`, plus ``asyncio.TimeoutError`` from the wait_for cap
+    enforced by the verify endpoint. Anything else collapses to
+    ``UNKNOWN_ERROR`` so the endpoint never raises and the frontend always
+    has a structured result to branch on.
     """
+    message = _sanitize_error_message(exc, llm)
     if isinstance(exc, LLMAuthenticationError):
-        return VerifyLLMResponse(status=VerifyLLMStatus.AUTH_ERROR, message=str(exc))
+        return VerifyLLMResponse(status=VerifyLLMStatus.AUTH_ERROR, message=message)
     if isinstance(exc, LLMRateLimitError):
-        return VerifyLLMResponse(status=VerifyLLMStatus.RATE_LIMITED, message=str(exc))
-    if isinstance(exc, LLMTimeoutError):
-        return VerifyLLMResponse(status=VerifyLLMStatus.TIMEOUT, message=str(exc))
+        return VerifyLLMResponse(status=VerifyLLMStatus.RATE_LIMITED, message=message)
+    if isinstance(exc, (LLMTimeoutError, asyncio.TimeoutError)):
+        return VerifyLLMResponse(status=VerifyLLMStatus.TIMEOUT, message=message)
     if isinstance(exc, LLMServiceUnavailableError):
-        return VerifyLLMResponse(status=VerifyLLMStatus.UNREACHABLE, message=str(exc))
+        return VerifyLLMResponse(status=VerifyLLMStatus.UNREACHABLE, message=message)
     if isinstance(exc, LLMBadRequestError):
-        return VerifyLLMResponse(status=VerifyLLMStatus.BAD_REQUEST, message=str(exc))
+        return VerifyLLMResponse(status=VerifyLLMStatus.BAD_REQUEST, message=message)
     logger.exception("llm.verify failed with an unmapped exception")
-    return VerifyLLMResponse(status=VerifyLLMStatus.UNKNOWN_ERROR, message=str(exc))
+    return VerifyLLMResponse(status=VerifyLLMStatus.UNKNOWN_ERROR, message=message)
 
 
 @llm_router.post("/verify", response_model=VerifyLLMResponse)
@@ -174,12 +225,18 @@ async def verify_llm_config(llm: LLM) -> VerifyLLMResponse:
       on the client.
     - The verify call path is the same code path used at conversation time,
       so "verified" really does mean "the agent will be able to use this".
+
+    The probe is hard-capped at :data:`_VERIFY_TIMEOUT_S` seconds (taking
+    the ``min`` with any smaller ``timeout`` the caller passed in the body)
+    so an unresponsive provider can't park an interactive UI on the SDK's
+    300 s default. A timeout is reported as ``status=TIMEOUT``.
     """
     provider = infer_litellm_provider(model=llm.model, api_base=llm.base_url)
+    timeout = min(llm.timeout or _VERIFY_TIMEOUT_S, _VERIFY_TIMEOUT_S)
     try:
-        await llm.averify()
+        await asyncio.wait_for(llm.averify(), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — verify must never raise
-        result = _verify_response_for_exception(exc)
+        result = _verify_response_for_exception(exc, llm)
         if result.provider is None:
             result = result.model_copy(update={"provider": provider})
         return result

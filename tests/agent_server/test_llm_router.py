@@ -1,5 +1,6 @@
 """Tests for LLM router."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -306,3 +307,83 @@ def test_verify_endpoint_keyless_local_server(client):
 
     assert response.status_code == 200
     assert response.json()["status"] == "success"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardening behaviors (timeout cap, error message sanitization)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_verify_endpoint_caps_hanging_probe_with_timeout(client):
+    """If ``averify`` hangs past the verify endpoint's hard cap, the request
+    must complete with ``status='timeout'`` rather than parking the UI on
+    the SDK's 300 s default ``LLM.timeout``."""
+
+    async def _hang(self):
+        await asyncio.sleep(5)  # well past the patched 0.05 s cap
+
+    with (
+        patch("openhands.agent_server.llm_router._VERIFY_TIMEOUT_S", 0.05),
+        patch.object(LLM, "averify", _hang),
+    ):
+        response = client.post("/api/llm/verify", json=_verify_payload())
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "timeout"
+    # Provider should still be attributed on timeout for the UI banner.
+    assert data["provider"] == "openai"
+
+
+def test_verify_endpoint_honors_smaller_caller_timeout(client):
+    """If the caller passes a ``timeout`` smaller than the endpoint cap, the
+    smaller value wins — callers can opt in to a tighter probe."""
+    captured: dict[str, float] = {}
+
+    async def _spy_wait_for(coro, timeout):
+        captured["timeout"] = timeout
+        coro.close()  # don't actually run the probe
+        raise TimeoutError
+
+    with (
+        patch("openhands.agent_server.llm_router._VERIFY_TIMEOUT_S", 30.0),
+        patch("openhands.agent_server.llm_router.asyncio.wait_for", _spy_wait_for),
+        patch.object(LLM, "averify", new_callable=AsyncMock),
+    ):
+        response = client.post("/api/llm/verify", json=_verify_payload(timeout=1))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "timeout"
+    assert captured["timeout"] == 1
+
+
+def test_verify_endpoint_scrubs_api_key_from_error_message(client):
+    """If a provider echoes the API key back in its error body, the value
+    must be scrubbed before it crosses the API boundary."""
+    secret = "sk-leaky-1234567890"
+    leak = f"401 Unauthorized: invalid key '{secret}' for endpoint"
+
+    with patch.object(LLM, "averify", new_callable=AsyncMock) as averify:
+        averify.side_effect = LLMAuthenticationError(leak)
+        response = client.post("/api/llm/verify", json=_verify_payload(api_key=secret))
+
+    data = response.json()
+    assert data["status"] == "auth_error"
+    assert secret not in data["message"]
+    assert "***" in data["message"]
+
+
+def test_verify_endpoint_truncates_pathological_error_messages(client):
+    """Provider error bodies (truncated HTML pages, oversized JSON blobs)
+    must be capped so the verify response can't balloon."""
+    huge_message = "x" * 10_000
+
+    with patch.object(LLM, "averify", new_callable=AsyncMock) as averify:
+        averify.side_effect = LLMBadRequestError(huge_message)
+        response = client.post("/api/llm/verify", json=_verify_payload())
+
+    data = response.json()
+    assert data["status"] == "bad_request"
+    # 512-char cap including the ``…`` ellipsis sentinel.
+    assert len(data["message"]) == 512
+    assert data["message"].endswith("…")

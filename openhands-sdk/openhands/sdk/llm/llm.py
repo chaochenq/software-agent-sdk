@@ -1311,6 +1311,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         ``max_tokens=1`` automatically.
         """
         probe = [Message(role="user", content=[TextContent(text="hi")])]
+        # _telemetry_ctx is intentionally discarded: verify probes must not
+        # fire on_request / on_response telemetry callbacks. They are not
+        # agent steps and should not contribute to spend tracking, prompt
+        # logs, or user-facing metrics.
         (
             formatted_messages,
             _cc_tools,
