@@ -343,6 +343,11 @@ class ResponseDispatchMixin:
                     on_event,
                     response_type=response_type,
                 )
+            case _:
+                raise AssertionError(
+                    "_dispatch_non_tool_response called with unexpected type: "
+                    f"{response_type!r}"
+                )
 
     def _emit_message_event(
         self,

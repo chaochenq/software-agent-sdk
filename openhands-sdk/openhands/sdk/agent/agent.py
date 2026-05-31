@@ -561,7 +561,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             ),
         )
 
-    def _check_blocked_user_message(self, state: ConversationState) -> bool:
+    def _handle_blocked_user_message(self, state: ConversationState) -> bool:
         """Check whether the last user message was blocked by a hook.
 
         Shared by :meth:`step` and :meth:`astep`. Returns ``True`` (and marks
@@ -599,6 +599,10 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         recover identically. Either emits a recovery event and returns (the
         caller should then return from its step), or re-raises ``error`` when
         no recovery is possible.
+
+        Every member of :data:`_RECOVERABLE_STEP_ERRORS` should have a
+        corresponding ``case`` below; any error not explicitly matched falls
+        through to ``case _: raise error``.
         """
         match error:
             case FunctionCallValidationError():
@@ -670,7 +674,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             return
 
         # Skip processing if the last user message was blocked by a hook
-        if self._check_blocked_user_message(state):
+        if self._handle_blocked_user_message(state):
             return
 
         # Prepare LLM messages using the utility function
@@ -741,7 +745,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             return
 
         # Skip processing if the last user message was blocked by a hook
-        if self._check_blocked_user_message(state):
+        if self._handle_blocked_user_message(state):
             return
 
         _messages_or_condensation = await aprepare_llm_messages(
