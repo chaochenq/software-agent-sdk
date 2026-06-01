@@ -1,5 +1,4 @@
 import json
-import warnings
 
 import pytest
 from fastmcp.mcp_config import MCPConfig
@@ -11,7 +10,6 @@ from openhands.sdk import (
     ACPAgentSettings,
     Agent,
     AgentContext,
-    AgentSettings,
     AgentSettingsBase,
     ConversationSettings,
     OpenHandsAgentSettings,
@@ -90,6 +88,8 @@ def test_llm_agent_settings_export_schema_groups_sections() -> None:
 
     assert llm_fields["llm.model"].value_type == "string"
     assert llm_fields["llm.model"].prominence is SettingProminence.CRITICAL
+    assert llm_fields["llm.max_input_tokens"].default is None
+    assert llm_fields["llm.max_output_tokens"].default is None
     assert llm_fields["llm.api_key"].label == "API Key"
     assert llm_fields["llm.api_key"].secret is True
     assert llm_fields["llm.api_key"].prominence is SettingProminence.CRITICAL
@@ -332,7 +332,7 @@ def test_validate_agent_settings_dispatches_on_agent_kind() -> None:
         {"agent_kind": "llm", "llm": {"model": "legacy-model"}}
     )
     assert isinstance(legacy_llm, OpenHandsAgentSettings)
-    assert legacy_llm.agent_kind == "llm"
+    assert legacy_llm.agent_kind == "openhands"
     assert legacy_llm.llm.model == "legacy-model"
 
     acp = validate_agent_settings(
@@ -346,8 +346,8 @@ def test_validate_agent_settings_dispatches_on_agent_kind() -> None:
     assert acp.acp_command == ["npx", "-y", "claude-agent-acp"]
 
 
-def test_agent_settings_from_persisted_migrates_v0_llm_payload() -> None:
-    settings = AgentSettings.from_persisted({"llm": {"model": "test-model"}})
+def test_validate_agent_settings_migrates_v0_llm_payload() -> None:
+    settings = validate_agent_settings({"llm": {"model": "test-model"}})
 
     assert isinstance(settings, OpenHandsAgentSettings)
     assert settings.schema_version == 3
@@ -355,8 +355,8 @@ def test_agent_settings_from_persisted_migrates_v0_llm_payload() -> None:
     assert settings.llm.model == "test-model"
 
 
-def test_agent_settings_from_persisted_dispatches_current_acp_payload() -> None:
-    settings = AgentSettings.from_persisted(
+def test_validate_agent_settings_dispatches_current_acp_payload() -> None:
+    settings = validate_agent_settings(
         {
             "schema_version": 1,
             "agent_kind": "acp",
@@ -371,10 +371,10 @@ def test_agent_settings_from_persisted_dispatches_current_acp_payload() -> None:
     assert settings.acp_command == ["npx", "-y", "claude-agent-acp"]
 
 
-def test_agent_settings_from_persisted_canonicalizes_legacy_llm_kind() -> None:
+def test_validate_agent_settings_canonicalizes_legacy_llm_kind() -> None:
     """v1 payloads with the deprecated ``agent_kind: 'llm'`` are migrated to
     the canonical ``'openhands'`` discriminator on read."""
-    settings = AgentSettings.from_persisted(
+    settings = validate_agent_settings(
         {
             "schema_version": 1,
             "agent_kind": "llm",
@@ -388,8 +388,8 @@ def test_agent_settings_from_persisted_canonicalizes_legacy_llm_kind() -> None:
     assert settings.llm.model == "legacy-model"
 
 
-def test_agent_settings_from_persisted_drops_legacy_verification_fields() -> None:
-    settings = AgentSettings.from_persisted(
+def test_validate_agent_settings_drops_legacy_verification_fields() -> None:
+    settings = validate_agent_settings(
         {
             "schema_version": 2,
             "agent_kind": "openhands",
@@ -409,9 +409,9 @@ def test_agent_settings_from_persisted_drops_legacy_verification_fields() -> Non
     assert "security_analyzer" not in verification
 
 
-def test_agent_settings_from_persisted_rejects_newer_schema_version() -> None:
+def test_validate_agent_settings_rejects_newer_schema_version() -> None:
     with pytest.raises(ValueError, match="newer than supported version 3"):
-        AgentSettings.from_persisted({"schema_version": 4, "llm": {"model": "m"}})
+        validate_agent_settings({"schema_version": 4, "llm": {"model": "m"}})
 
 
 def test_conversation_settings_from_persisted_migrates_v0_payload() -> None:
@@ -472,12 +472,21 @@ def test_llm_create_agent_serializes_typed_mcp_config_compactly() -> None:
 
 
 def test_llm_create_agent_builds_condenser_when_enabled() -> None:
+    llm = LLM(model="test-model", usage_id="agent")
+    agent_metrics = llm.metrics
     settings = OpenHandsAgentSettings(
+        llm=llm,
         condenser=CondenserSettings(enabled=True, max_size=100),
     )
     agent = settings.create_agent()
+
+    assert agent.llm is llm
     assert isinstance(agent.condenser, LLMSummarizingCondenser)
     assert agent.condenser.max_size == 100
+    assert agent.condenser.llm is not llm
+    assert agent.condenser.llm.model == llm.model
+    assert agent.condenser.llm.usage_id == "condenser"
+    assert agent.condenser.llm.metrics is not agent_metrics
 
 
 def test_llm_create_agent_no_condenser_when_disabled() -> None:
@@ -656,73 +665,25 @@ def test_acp_create_agent_passes_resolved_env_and_agent_context() -> None:
     assert agent.agent_context == context
 
 
-# ---------------------------------------------------------------------------
-# Legacy ``AgentSettings`` compatibility
-# ---------------------------------------------------------------------------
-
-
-def test_legacy_agent_settings_still_instantiates_as_llm_variant() -> None:
-    """``AgentSettings(...)`` is retained as a deprecated OpenHandsAgentSettings.
-
-    All v1.17.0 attributes must remain reachable so the API breakage
-    check does not flag them as removed.
-    """
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        settings = AgentSettings(llm=LLM(model="test-model"))
-
-    # The legacy name emits a DeprecationWarning on construction. The
-    # warning's scheduled removal is in 1.23.0 per the class docstring.
-    assert any("AgentSettings" in str(w.message) for w in caught), (
-        f"expected deprecation warning, got: {[str(w.message) for w in caught]}"
-    )
-
-    # It remains a LLMAgentSettings (and thus OpenHandsAgentSettings) subclass
-    # so existing code paths work.
-    assert isinstance(settings, OpenHandsAgentSettings)
-    # agent_kind stays "llm" because AgentSettings inherits from LLMAgentSettings
-    # — this keeps the published API surface unchanged for the breakage checker.
-    assert settings.agent_kind == "llm"
-    assert settings.llm.model == "test-model"
-
-
-def test_legacy_agent_settings_retains_all_v1_17_attributes() -> None:
-    """Guardrail mirroring the API breakage CI check: don't silently remove fields."""
-    fields = AgentSettings.model_fields
-    assert {
-        "schema_version",
-        "agent",
-        "llm",
-        "tools",
-        "mcp_config",
-        "agent_context",
-        "condenser",
-        "verification",
-    }.issubset(set(fields))
-
-    # Methods defined on the original class must still resolve via
-    # inheritance.
-    for name in ("export_schema", "create_agent", "build_condenser", "build_critic"):
-        assert hasattr(AgentSettings, name), f"missing: AgentSettings.{name}"
-
-
-def test_llm_agent_settings_deprecated_alias_emits_warning() -> None:
-    """Importing ``LLMAgentSettings`` emits DeprecationWarning at import time."""
+def test_llm_agent_settings_public_alias_removed() -> None:
+    """The deprecated ``LLMAgentSettings`` public import aliases were removed in
+    v1.24.0; the class itself is retained (internal-only) for the union."""
+    import openhands.sdk as _sdk_mod
     import openhands.sdk.settings as _settings_mod
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        cls = getattr(_settings_mod, "LLMAgentSettings")
+    with pytest.raises(AttributeError):
+        getattr(_settings_mod, "LLMAgentSettings")
+    with pytest.raises(AttributeError):
+        getattr(_sdk_mod, "LLMAgentSettings")
 
-    assert any("LLMAgentSettings" in str(w.message) for w in caught), (
-        f"expected deprecation warning, got: {[str(w.message) for w in caught]}"
-    )
-    assert issubclass(cls, OpenHandsAgentSettings)
-    # Construction itself does not emit a second warning.
-    settings = cls(llm=LLM(model="test-model"))
+    # The class is still reachable at its canonical internal location and keeps
+    # agent_kind="llm" so the discriminated union deserializes legacy payloads
+    # and the API-breakage checker sees no field-value change.
+    from openhands.sdk.settings.model import LLMAgentSettings
+
+    assert issubclass(LLMAgentSettings, OpenHandsAgentSettings)
+    settings = LLMAgentSettings(llm=LLM(model="test-model"))
     assert isinstance(settings, OpenHandsAgentSettings)
-    # LLMAgentSettings keeps its own agent_kind="llm" so the API-breakage
-    # checker sees no field-value change vs the published PyPI release.
     assert settings.agent_kind == "llm"
     assert settings.llm.model == "test-model"
 
@@ -834,7 +795,7 @@ def test_acp_agent_settings_acp_env_encrypts_with_cipher() -> None:
     restored = ACPAgentSettings.model_validate(dumped, context={"cipher": cipher})
     assert restored.acp_env == {"OPENAI_API_KEY": "sk-real-secret"}
 
-    restored_from_persisted = AgentSettings.from_persisted(
+    restored_from_persisted = validate_agent_settings(
         dumped, context={"cipher": cipher}
     )
     assert isinstance(restored_from_persisted, ACPAgentSettings)
