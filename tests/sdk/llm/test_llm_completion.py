@@ -827,10 +827,6 @@ def test_llm_streaming_preserves_cache_read_tokens(mock_completion):
     )
 
 
-# This file focuses on LLM completion functionality, configuration options,
-# and metrics tracking for the synchronous LLM implementation
-
-
 @patch("openhands.sdk.llm.llm.litellm_completion")
 def test_completion_retries_without_caching_on_prompt_cache_too_small(
     mock_completion,
