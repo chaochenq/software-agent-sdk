@@ -103,8 +103,8 @@ def select_chat_options(
     if ctx.session_id:
         existing = out.get("extra_headers") or {}
         out["extra_headers"] = {
-            "x-litellm-session-id": ctx.session_id,
             **existing,
+            "x-litellm-session-id": ctx.session_id,
         }
 
     return out

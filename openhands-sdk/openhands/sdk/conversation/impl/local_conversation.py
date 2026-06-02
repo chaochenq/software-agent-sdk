@@ -722,25 +722,35 @@ class LocalConversation(BaseConversation):
     def _bind_conversation_context(self, llm: LLM) -> None:
         """Bind per-conversation call context to *llm*.
 
-        Stores the conversation ID as the session-affinity header value and,
-        if not already set, the prompt-cache shard key.  The prompt_cache_key
-        guard preserves inheritance: sub-agent LLMs arrive with the parent's
-        key via ``model_copy()`` and should keep it so sibling sub-agents
-        share the same OpenAI prefix-cache shard (#2904).
+        Stores the conversation ID as the session-affinity header value and
+        prompt-cache shard key.  ``session_id`` is always set to the current
+        conversation.  ``prompt_cache_key`` is preserved when inherited from
+        a parent via ``model_copy()`` (sub-agent cache-shard sharing) but
+        overwritten when the same LLM object is reused across sequential
+        top-level conversations.
 
-        Values live in a ``PrivateAttr`` so they are:
-        * dropped on ``model_dump()``/``model_validate()`` round-trips (fork),
-        * shallow-copied by ``model_copy()`` (sub-agent inheritance),
-        * injected at call time by ``select_chat_options`` /
-          ``select_responses_options``.
+        The distinction relies on ``source_llm_id``: after binding, the
+        context records ``id(llm)``.  A ``model_copy()``'d sub-agent LLM
+        has a different ``id()`` than the recorded source, so the inherited
+        key is kept.  The same LLM reused in a new conversation matches,
+        so the key is refreshed.
 
         See #3443 for background.
         """
         conv_id = str(self._state.id)
         existing = llm._call_context
+        # Preserve prompt_cache_key only when inherited via model_copy()
+        # (sub-agent): the source_llm_id won't match this LLM's id().
+        # For sequential reuse of the same object, overwrite.
+        inherited = (
+            existing.prompt_cache_key is not None
+            and existing.source_llm_id is not None
+            and existing.source_llm_id != id(llm)
+        )
         llm._call_context = LLMCallContext(
-            prompt_cache_key=existing.prompt_cache_key or conv_id,
+            prompt_cache_key=existing.prompt_cache_key if inherited else conv_id,
             session_id=conv_id,
+            source_llm_id=id(llm),
         )
 
     def switch_llm(self, llm: LLM) -> None:

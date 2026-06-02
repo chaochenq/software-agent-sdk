@@ -175,10 +175,17 @@ class LLMCallContext:
     * dropped on ``model_dump()`` / ``model_validate()`` round-trips (fork),
     * shallow-copied by ``model_copy()`` (sub-agent inheritance),
     * never serialised into user-visible config.
+
+    ``source_llm_id`` records the ``id()`` of the LLM that was originally
+    bound.  When ``model_copy()`` creates a sub-agent LLM, the shallow-copied
+    context retains the *parent* LLM's id, so ``_bind_conversation_context``
+    can distinguish inherited context (preserve ``prompt_cache_key``) from
+    sequential reuse of the same object (overwrite).
     """
 
     prompt_cache_key: str | None = None
     session_id: str | None = None
+    source_llm_id: int | None = None
 
 
 class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
