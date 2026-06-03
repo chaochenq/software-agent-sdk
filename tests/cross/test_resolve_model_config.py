@@ -668,6 +668,7 @@ def test_gemini_3_5_flash_config():
     assert model["id"] == "gemini-3.5-flash"
     assert model["display_name"] == "Gemini 3.5 Flash"
     assert model["llm_config"]["model"] == "litellm_proxy/gemini-3.5-flash"
+    assert model["llm_config"]["temperature"] == 0.0
 
 
 def test_nemotron_3_ultra_550b_a55b_config():
