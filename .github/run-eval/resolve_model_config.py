@@ -366,12 +366,20 @@ MODELS = {
         },
     },
     # https://static.stepfun.com/blog/step-3.7-flash/
+    # Step 3.7 Flash is a multimodal MoE VLM with selectable OpenRouter
+    # reasoning levels (high/medium/low). We opt into "high" via
+    # litellm_extra_body because LiteLLM does not yet expose
+    # `reasoning_effort` as a supported param for this OpenRouter target,
+    # so the top-level `reasoning_effort` field would be dropped before
+    # send. Vision is gated by LiteLLM / proxy `supports_vision` metadata
+    # and cannot be force-enabled from llm_config.
     "step-3.7-flash": {
         "id": "step-3.7-flash",
         "display_name": "Step 3.7 Flash",
         "llm_config": {
             "model": "litellm_proxy/openrouter/stepfun/step-3.7-flash",
             "temperature": 0.0,
+            "litellm_extra_body": {"reasoning": {"effort": "high"}},
         },
     },
 }

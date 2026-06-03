@@ -123,11 +123,11 @@ the **provider's official documentation** (don't rely only on LiteLLM):
    - Decision matrix:
      | Provider style | LiteLLM `reasoning_effort` support | Action |
      |----------------|-------------------------------------|--------|
-     | OpenAI-style reasoning items (e.g. GPT-5, OpenRouter reasoning levels) | ✅ | Optionally pin `"reasoning_effort": "high"` in `llm_config`. If pinned, remove `temperature` / `top_p` (they'll be auto-stripped). |
-     | OpenAI-style reasoning items | ❌ | **Do not** add `reasoning_effort` — `drop_params=True` will strip it before send. Leave the model at provider defaults; reasoning will still work, but you can't tune the level from `llm_config` until LiteLLM exposes the param. |
+     | OpenAI-style reasoning items (e.g. GPT-5, OpenRouter reasoning levels) | ✅ | Pin `"reasoning_effort": "high"` in `llm_config`. If pinned, remove `temperature` / `top_p` (they'll be auto-stripped). |
+     | OpenAI-style reasoning items (OpenRouter native `reasoning` block) | ❌ | Pin via provider-specific passthrough: `"litellm_extra_body": {"reasoning": {"effort": "high"}}`. The top-level `reasoning_effort` would be dropped by `drop_params=True`, but `litellm_extra_body` is forwarded to the provider. Same pattern as `qwen3-max-thinking` (which uses `{"enable_thinking": True}`). |
      | Anthropic extended thinking (Claude Sonnet 4.5+, Haiku 4.5) | n/a | Add the model identifier to `EXTENDED_THINKING_MODELS` in `model_features.py` (see Step 2). |
      | Non-reasoning model | n/a | Do nothing. |
-   - Note the result in the PR description (e.g., "Reasoning: OpenRouter exposes high/medium/low; LiteLLM does not yet expose `reasoning_effort` for this model — leaving it unset; condenser thinking-block test will skip (expected for non-Anthropic reasoning models)").
+   - Note the result in the PR description (e.g., "Reasoning: OpenRouter exposes high/medium/low; LiteLLM does not yet expose `reasoning_effort`, so opting in via `litellm_extra_body`; condenser thinking-block test will skip — expected for non-Anthropic reasoning models").
 
 The integration runner correctly **skips** vision / extended-thinking tests
 when the SDK can't detect support. A skipped test for one of these reasons

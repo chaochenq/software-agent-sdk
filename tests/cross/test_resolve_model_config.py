@@ -703,3 +703,9 @@ def test_step_3_7_flash_config():
         == "litellm_proxy/openrouter/stepfun/step-3.7-flash"
     )
     assert model["llm_config"]["temperature"] == 0.0
+    # Opt into OpenRouter's "high" reasoning level via litellm_extra_body,
+    # because LiteLLM does not yet expose `reasoning_effort` as a top-level
+    # supported param for this target.
+    assert model["llm_config"]["litellm_extra_body"] == {
+        "reasoning": {"effort": "high"}
+    }
