@@ -16,7 +16,6 @@ from openhands.sdk import (
     Agent,
     Message,
     TextContent,
-    get_logger,
 )
 from openhands.sdk.context.condenser import CondenserBase
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
@@ -27,9 +26,6 @@ from openhands.sdk.event.llm_convertible import (
 )
 from openhands.sdk.tool import Tool
 from tests.integration.early_stopper import EarlyStopperBase, EarlyStopResult
-
-
-logger = get_logger(__name__)
 
 
 # Tool preset type for selecting which file editing toolset to use
@@ -138,36 +134,6 @@ class BaseIntegrationTest(ABC):
         }
 
         self.llm: LLM = LLM(**llm_kwargs, usage_id="test-llm")
-        # TEMPORARY DIAGNOSTIC for PR #3477 (step-3.7-flash) — to be reverted
-        # once we confirm why _model_info is None from the eval proxy.
-        # Track: https://github.com/OpenHands/software-agent-sdk/pull/3477
-        if "step-3.7-flash" in self.llm.model:
-            import httpx
-
-            try:
-                probe = httpx.get(
-                    f"{base_url}/v1/model/info",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10.0,
-                )
-                body = probe.text
-                hit_count = body.count('"step-3.7-flash"')
-                logger.info(
-                    "[diagnostic PR #3477 probe] status=%d body_len=%d "
-                    "step_3_7_flash_substrings=%d body_head=%r",
-                    probe.status_code,
-                    len(body),
-                    hit_count,
-                    body[:500],
-                )
-            except Exception as exc:
-                logger.info("[diagnostic PR #3477 probe] EXC=%r", exc)
-        logger.info(
-            "[diagnostic PR #3477] model=%s model_info=%s vision_is_active=%s",
-            self.llm.model,
-            self.llm._model_info,
-            self.llm.vision_is_active(),
-        )
         self.agent: Agent = Agent(
             llm=self.llm, tools=self.tools, condenser=self.condenser
         )
