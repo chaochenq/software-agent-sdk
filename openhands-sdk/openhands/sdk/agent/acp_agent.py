@@ -23,7 +23,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
@@ -73,7 +73,6 @@ from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import LLM, ImageContent, Message, MessageToolCall, TextContent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability.laminar import maybe_init_laminar, observe
-from openhands.sdk.secret import SecretSource
 from openhands.sdk.settings.acp_providers import (
     ACPFileSecretSpec,
     build_session_model_meta,
@@ -807,6 +806,11 @@ class _OpenHandsACPBridge:
         # event stream in cleartext. ``None`` ⇒ no-op (bridge used standalone).
         self.mask: Callable[[str], str] | None = None
         self._last_activity_signal: float = float("-inf")
+        # Monotonic timestamp of the most recent ``session_update``. Unlike the
+        # throttled ``_last_activity_signal``, updated on *every* update so the
+        # prompt idle-timeout watchdog sees real progress. Armed per turn via
+        # ``arm_activity_clock``.
+        self._last_activity_monotonic: float = float("-inf")
         # Telemetry state from UsageUpdate (persists across turns)
         self._last_cost: float = 0.0  # last cumulative cost seen
         self._last_cost_by_session: dict[str, float] = {}
@@ -832,6 +836,26 @@ class _OpenHandsACPBridge:
         self._usage_received.clear()
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
+
+    def arm_activity_clock(self) -> None:
+        """Mark "now" as the last activity for the idle-timeout watchdog.
+
+        Called at the start of each prompt (and each retry) so the idle
+        window is measured from the moment the prompt is sent rather than
+        from a stale value — a server that legitimately takes a while before
+        its first ``session_update`` must not be killed prematurely.
+        """
+        self._last_activity_monotonic = time.monotonic()
+
+    def seconds_since_last_activity(self) -> float:
+        """Seconds since the last ``session_update`` (or ``arm_activity_clock``).
+
+        Drives the prompt idle-timeout: any streamed token, thought, tool-call
+        start/progress, or usage update from the ACP server resets the clock,
+        so a steadily-progressing agent never trips the deadline while a
+        genuinely silent (hung) server still does.
+        """
+        return time.monotonic() - self._last_activity_monotonic
 
     def prepare_usage_sync(self, session_id: str) -> asyncio.Event:
         """Prepare per-turn UsageUpdate synchronization for a session."""
@@ -889,6 +913,12 @@ class _OpenHandsACPBridge:
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         logger.debug("ACP session_update: type=%s", type(update).__name__)
+
+        # Any update — token, thought, tool-call start/progress, usage — is
+        # progress: reset the idle clock so the prompt's inactivity watchdog
+        # keeps a steadily-working agent alive (unthrottled, unlike the
+        # heartbeat in ``_maybe_signal_activity``).
+        self._last_activity_monotonic = time.monotonic()
 
         # Route fork session updates to the fork accumulator. ask_agent() joins
         # and returns this text to the caller (a UI/network sink), so mask it
@@ -1212,8 +1242,13 @@ class ACPAgent(AgentBase):
     acp_prompt_timeout: float = Field(
         default=1800.0,
         description=(
-            "Timeout in seconds for a single ACP prompt() call. "
-            "Prevents indefinite hangs when the ACP server fails to respond."
+            "Inactivity timeout in seconds for a single ACP prompt() call. "
+            "The deadline resets on every update from the ACP server (token, "
+            "thought, tool-call progress, usage), so a steadily-progressing "
+            "agent runs as long as it keeps making progress; the prompt is "
+            "only aborted after this many seconds with no activity at all. "
+            "Prevents indefinite hangs when the ACP server stops responding "
+            "without killing legitimately long-running work."
         ),
     )
     acp_model: str | None = Field(
@@ -1767,25 +1802,18 @@ class ACPAgent(AgentBase):
         advertisement: their values are written to disk, not injected as env
         vars, so advertising them as available env vars would mislead the agent.
         """
-        secret_infos = state.secret_registry.get_secret_infos()
-        agent_context = self.agent_context
+        # Advertise from state.secret_registry alone — it now holds
+        # agent_context.secrets too (seeded at conversation init, with their
+        # descriptions), so it is the single source for the <CUSTOM_SECRETS>
+        # block. Reserved file-content secrets are written to disk, not injected
+        # as env vars, so drop them from the advertisement.
         file_secret_names = self._present_file_secret_names(state)
-        if file_secret_names:
-            secret_infos = [
-                info
-                for info in secret_infos
-                if info.get("name") not in file_secret_names
-            ]
-            if agent_context is not None and agent_context.secrets:
-                agent_context = agent_context.model_copy(
-                    update={
-                        "secrets": {
-                            name: secret
-                            for name, secret in agent_context.secrets.items()
-                            if name not in file_secret_names
-                        }
-                    }
-                )
+        secret_infos = [
+            info
+            for info in state.secret_registry.get_secret_infos()
+            if info.get("name") not in file_secret_names
+        ]
+        agent_context = self.agent_context
         if agent_context is None:
             # No caller-supplied context. Only synthesize an empty one for the
             # renderer if we actually have a registry-secret advertisement to
@@ -1795,53 +1823,29 @@ class ACPAgent(AgentBase):
             # suppress.
             if not secret_infos:
                 return None
-            return AgentContext(current_datetime=None).to_acp_prompt_context(
-                additional_secret_infos=secret_infos
-            )
+            agent_context = AgentContext(current_datetime=None)
+        elif agent_context.secrets:
+            # The registry already carries these (and their descriptions), so
+            # clear the agent_context copy to advertise from the registry alone
+            # rather than re-merging a redundant second source.
+            agent_context = agent_context.model_copy(update={"secrets": {}})
         return agent_context.to_acp_prompt_context(additional_secret_infos=secret_infos)
-
-    def _read_conversation_secret(
-        self, state: ConversationState, name: str
-    ) -> str | None:
-        """Read a secret value from the canonical channel, then the drain.
-
-        Prefers ``state.secret_registry`` — the canonical channel, where
-        ``create_request`` lifts ``agent_context.secrets`` on the Python /
-        OpenHands-cloud path and where ``StartConversationRequest.secrets``
-        land — and falls back to ``agent_context.secrets`` for topologies that
-        do not call ``create_request`` (notably canvas-local). See #1022.
-        """
-        if name in state.secret_registry.secret_sources:
-            value = state.secret_registry.get_secret_value(name)
-            if value:
-                return value
-        if self.agent_context and self.agent_context.secrets:
-            secret = self.agent_context.secrets.get(name)
-            if secret is not None:
-                return (
-                    secret.get_value()
-                    if isinstance(secret, SecretSource)
-                    else str(secret)
-                )
-        return None
 
     def _present_file_secret_names(self, state: ConversationState) -> set[str]:
         """Reserved file-content secret names supplied for this conversation.
 
         A name counts as present if it is configured in
-        :attr:`acp_file_secrets` *and* appears in either credential channel
-        (``state.secret_registry`` or ``agent_context.secrets``). These names
-        are materialised to disk and therefore excluded from the plain env-var
-        injection and the ``<CUSTOM_SECRETS>`` advertisement (their values are
-        file blobs, not env vars the subprocess can reference by name).
+        :attr:`acp_file_secrets` *and* registered in ``state.secret_registry``
+        (which holds ``agent_context.secrets`` too, seeded at conversation
+        init). These names are materialised to disk and therefore excluded from
+        the plain env-var injection and the ``<CUSTOM_SECRETS>`` advertisement
+        (their values are file blobs, not env vars the subprocess can reference
+        by name).
         """
         configured = {spec.secret_name for spec in self.acp_file_secrets}
         if not configured:
             return set()
-        present = set(state.secret_registry.secret_sources)
-        if self.agent_context and self.agent_context.secrets:
-            present |= set(self.agent_context.secrets)
-        return present & configured
+        return set(state.secret_registry.secret_sources) & configured
 
     def _acp_file_secret_dir(self, state: ConversationState, subdir: str) -> Path:
         """Durable per-conversation directory for a credential file.
@@ -1900,8 +1904,8 @@ class ACPAgent(AgentBase):
         need a narrower scope can pin ``HOME`` via ``acp_env`` (honoured below)
         or leave isolation off for Gemini.
 
-        Ordering contract: this runs *after* the secret_registry / agent_context
-        drain and the ``acp_env`` update in :meth:`_start_acp_server`, so the
+        Ordering contract: this runs *after* the ``secret_registry`` injection
+        and the ``acp_env`` update in :meth:`_start_acp_server`, so the
         credential vars it inspects (``ANTHROPIC_API_KEY`` /
         ``CLAUDE_CODE_OAUTH_TOKEN``) are already hydrated into ``env``. Calling it
         earlier would misread the active credential and wrongly relocate Claude.
@@ -1929,12 +1933,11 @@ class ACPAgent(AgentBase):
     ) -> None:
         """Seed reserved file-content credentials onto disk and point the CLI at them.
 
-        For each spec in :attr:`acp_file_secrets` whose secret is present in
-        either credential channel (see :meth:`_read_conversation_secret`), write
-        its value to the spec's durable per-conversation directory
-        (:meth:`_acp_file_secret_dir`) and set the controlling env var
-        (``CODEX_HOME`` / ``GOOGLE_APPLICATION_CREDENTIALS``) unless the caller
-        pinned it via ``acp_env``.
+        For each spec in :attr:`acp_file_secrets` whose secret is registered in
+        ``state.secret_registry``, write its value to the spec's durable
+        per-conversation directory (:meth:`_acp_file_secret_dir`) and set the
+        controlling env var (``CODEX_HOME`` / ``GOOGLE_APPLICATION_CREDENTIALS``)
+        unless the caller pinned it via ``acp_env``.
 
         Seed-if-absent: a non-empty existing file is preserved, never clobbered
         — so a token the CLI rewrites on refresh (Codex) survives a recycle, and
@@ -1950,7 +1953,7 @@ class ACPAgent(AgentBase):
         """
         for spec in self.acp_file_secrets:
             name = spec.secret_name
-            value = self._read_conversation_secret(state, name)
+            value = state.secret_registry.get_secret_value(name)
             if not value:
                 continue
             # Seed where the data-dir env var will actually point: an explicit
@@ -2036,28 +2039,17 @@ class ACPAgent(AgentBase):
         client.mask = state.secret_registry.mask_secrets_in_output
 
         # Build the subprocess environment. Precedence, highest first:
-        #   acp_env > state.secret_registry > agent_context.secrets
-        #     > os.environ > default_environment
+        #   acp_env > state.secret_registry > os.environ > default_environment
         #
-        # Conversation credentials (the registry and the agent_context drain)
-        # intentionally OVERRIDE ambient os.environ: an explicit per-conversation
-        # / provider secret must win over a same-named variable in the
-        # agent-server's own environment (os.environ is the wrong process for a
-        # remote server). acp_env (deprecated) stays highest.
+        # Conversation credentials intentionally OVERRIDE ambient os.environ: an
+        # explicit per-conversation / provider secret must win over a same-named
+        # variable in the agent-server's own environment. acp_env (deprecated)
+        # stays highest.
         #
-        # Two conversation channels, because an ACP subprocess is a black box we
-        # cannot name-scan per command (unlike the regular agent's bash tool), so
-        # credentials must be injected upfront:
-        #   - state.secret_registry: the canonical channel
-        #     (StartConversationRequest.secrets; also where create_request lifts
-        #     agent_context.secrets on the Python-caller path / OpenHands cloud).
-        #   - agent_context.secrets drain: the ONLY channel that delivers
-        #     agent_context.secrets on paths that do NOT call create_request —
-        #     notably canvas-local, which builds the request in TypeScript and
-        #     relies on the server's create_agent() to fold llm.api_key into
-        #     agent_context.secrets. There is no server-side agent_context.secrets
-        #     → registry lift, so keep this drain until one exists.
-        # On a key collision the registry wins over the drain.
+        # agent_context.secrets are seeded into secret_registry at
+        # LocalConversation.__init__ (lower priority than request.secrets), so
+        # the registry is now the single channel for all secrets including
+        # provider credentials folded in by ACPAgentSettings.create_agent().
         env = default_environment()
         env.update(os.environ)
         if self.acp_env:
@@ -2076,34 +2068,17 @@ class ACPAgent(AgentBase):
         # injected as env vars, so exclude their (large blob) names from the
         # plain env-injection below; materialisation sets only the path env var.
         file_secret_names = self._present_file_secret_names(state)
-        # agent_context.secrets drain (lower precedence than the registry).
-        # Skip keys a higher tier will set — acp_env (applied last) and the
-        # registry (applied next) — to avoid a wasted SecretSource.get_value()
-        # (LookupSecret can make an HTTP request).
-        registry_names = set(state.secret_registry.secret_sources)
-        if self.agent_context and self.agent_context.secrets:
-            for name, secret in self.agent_context.secrets.items():
-                if (
-                    name in self.acp_env
-                    or name in registry_names
-                    or name in file_secret_names
-                ):
-                    continue
-                value = (
-                    secret.get_value()
-                    if isinstance(secret, SecretSource)
-                    else str(secret)
-                )
-                if value:
-                    env[name] = value
-        # state.secret_registry overrides the drain and ambient os.environ. Skip
-        # keys acp_env will set (avoids a redundant LookupSecret.get_value()).
-        for name in state.secret_registry.secret_sources:
-            if name in self.acp_env or name in file_secret_names:
-                continue
-            value = state.secret_registry.get_secret_value(name)
-            if value:
-                env[name] = value
+        # Inject the whole registry: an ACP CLI is a black box we can't
+        # name-scan per command (unlike the regular agent's bash tool), so
+        # credentials must be delivered upfront. Registry values override
+        # ambient os.environ. Skip keys acp_env will set last (avoids a
+        # redundant LookupSecret.get_value()) and file secrets (materialised to
+        # disk below).
+        env.update(
+            state.secret_registry.get_all_secrets_as_env_vars(
+                exclude=set(self.acp_env) | file_secret_names
+            )
+        )
         # Materialise reserved file-content secrets to disk and point their
         # data-dir env vars (CODEX_HOME / GOOGLE_APPLICATION_CREDENTIALS) at the
         # written files. Done before acp_env so an explicit acp_env override of
@@ -2117,7 +2092,7 @@ class ACPAgent(AgentBase):
         # Relocate the CLI's data/config root to a per-conversation directory so
         # sandbox-sharing conversations don't race on a shared HOME (#1019).
         # Ordering is load-bearing — this must run AFTER the registry /
-        # agent_context drain and the acp_env update above (so the credential
+        # registry injection and the acp_env update above (so the credential
         # vars its Claude carve-out inspects — ANTHROPIC_API_KEY /
         # CLAUDE_CODE_OAUTH_TOKEN — are already in env, and an acp_env pin wins)
         # and BEFORE the conflict-strip below (so a CLAUDE_CONFIG_DIR it sets is
@@ -2438,6 +2413,9 @@ class ACPAgent(AgentBase):
         self._client.on_token = on_token
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
+        # Start the idle-timeout clock fresh for this attempt so the deadline
+        # is measured from the send (or retry), not from a stale value.
+        self._client.arm_activity_clock()
 
     def _cancel_inflight_tool_calls(self) -> None:
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
@@ -2695,27 +2673,71 @@ class ACPAgent(AgentBase):
                 )
         return response
 
+    def _idle_timeout_message(self) -> str:
+        return (
+            f"ACP prompt timed out after {self.acp_prompt_timeout:.0f}s "
+            "with no activity from the ACP server"
+        )
+
+    async def _await_with_idle_deadline(
+        self,
+        awaitable: Awaitable[PromptResponse | None],
+        *,
+        cancel_on_exit: bool,
+    ) -> PromptResponse | None:
+        """Await *awaitable*, aborting only after a stretch of inactivity.
+
+        The deadline is an *idle* timeout, not a hard turn deadline: any
+        ``session_update`` from the ACP server (token, thought, tool-call
+        start/progress, usage) resets ``acp_prompt_timeout``, so a steadily-
+        progressing agent runs as long as it keeps making progress while a
+        genuinely silent (hung) server is still cut off after the idle window.
+        This is what keeps long-running ACP commands alive (issue
+        agent-canvas#1245).
+
+        ``asyncio.wait`` (not ``wait_for``) drives the polling so an idle-check
+        slice elapsing never cancels the underlying prompt — only a true idle
+        period raises ``TimeoutError``. ``cancel_on_exit`` controls cleanup:
+        the sync path passes ``True`` to cancel the prompt coroutine it owns;
+        the async path passes ``False`` because the portal task must survive
+        for ``astep``'s ``session/cancel`` + drain handler.
+        """
+        idle_limit = self.acp_prompt_timeout
+        fut = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                remaining = idle_limit - self._client.seconds_since_last_activity()
+                if remaining <= 0:
+                    raise TimeoutError(self._idle_timeout_message())
+                # wait() returns when the prompt finishes or the slice elapses,
+                # leaving fut untouched either way.
+                await asyncio.wait({fut}, timeout=remaining)
+                if fut.done():
+                    return fut.result()
+                # Slice elapsed: only give up if the server produced nothing in
+                # the meantime, otherwise the loop re-arms with a fresh window.
+                if self._client.seconds_since_last_activity() >= idle_limit:
+                    raise TimeoutError(self._idle_timeout_message())
+        finally:
+            if cancel_on_exit and not fut.done():
+                fut.cancel()
+
     async def _await_prompt_response_with_timeout(
         self,
         prompt_future: Future[PromptResponse | None],
     ) -> PromptResponse | None:
-        """Await an ACP prompt with a hard turn deadline.
+        """Await an ACP prompt with an idle (inactivity) turn deadline.
 
-        The terminal tool reports hard command timeouts back to the agent
-        instead of waiting forever for active commands. ACP prompts follow the
-        same rule: activity heartbeats keep the server alive, but they do not
-        extend this prompt deadline. The timeout handler sends ``session/cancel``
-        and closes any in-flight tool cards.
+        Wraps the portal-side prompt future in :meth:`_await_with_idle_deadline`
+        so the prompt is only abandoned after ``acp_prompt_timeout`` seconds
+        with no ACP activity. The timeout handler in ``astep`` sends
+        ``session/cancel`` and closes any in-flight tool cards.
         """
-        try:
-            return await asyncio.wait_for(
-                asyncio.shield(asyncio.wrap_future(prompt_future)),
-                timeout=self.acp_prompt_timeout,
-            )
-        except TimeoutError as exc:
-            raise TimeoutError(
-                f"ACP prompt timed out after {self.acp_prompt_timeout:.0f}s"
-            ) from exc
+        # cancel_on_exit=False: the portal task behind ``prompt_future`` must
+        # outlive an idle timeout / cancellation so astep's drain can observe it.
+        return await self._await_with_idle_deadline(
+            asyncio.wrap_future(prompt_future), cancel_on_exit=False
+        )
 
     @staticmethod
     def _prompt_response_was_cancelled(response: PromptResponse | None) -> bool:
@@ -2797,12 +2819,11 @@ class ACPAgent(AgentBase):
         state: ConversationState,
         on_event: ConversationCallbackType,
     ) -> None:
-        """Error path when ``conn.prompt`` exceeded ``acp_prompt_timeout``."""
+        """Error path when ``conn.prompt`` went idle past ``acp_prompt_timeout``."""
         logger.error(
-            "ACP prompt timed out after %.1fs (limit=%.0fs). "
-            "The ACP server may have completed its work but failed to "
-            "send the JSON-RPC response. Accumulated %d text chunks, "
-            "%d tool calls.",
+            "ACP prompt timed out after %.1fs with no activity for the last "
+            "%.0fs. The ACP server may have stalled or failed to send the "
+            "JSON-RPC response. Accumulated %d text chunks, %d tool calls.",
             elapsed,
             self.acp_prompt_timeout,
             len(self._client.accumulated_text),
@@ -2813,9 +2834,10 @@ class ACPAgent(AgentBase):
             content=[
                 TextContent(
                     text=(
-                        f"ACP prompt timed out after {elapsed:.0f}s. "
-                        "The agent may have completed its work but "
-                        "the response was not received."
+                        "ACP prompt timed out after "
+                        f"{self.acp_prompt_timeout:.0f}s with no activity from "
+                        "the agent. The agent may have stalled, or it may have "
+                        "completed its work but the response was not received."
                     )
                 )
             ],
@@ -2940,7 +2962,7 @@ class ACPAgent(AgentBase):
         t0 = time.monotonic()
         try:
             logger.info(
-                "Sending ACP prompt (timeout=%.0fs, blocks=%d)",
+                "Sending ACP prompt (idle_timeout=%.0fs, blocks=%d)",
                 self.acp_prompt_timeout,
                 len(prompt_blocks),
             )
@@ -2949,14 +2971,16 @@ class ACPAgent(AgentBase):
 
             async def _prompt() -> PromptResponse | None:
                 # Thin closure so existing mocks of ``_executor.run_async``
-                # that take a single positional callable keep working.
-                return await self._do_acp_prompt(prompt_blocks)
+                # that take a single positional callable keep working. The idle
+                # deadline is enforced inside (cancel_on_exit=True: this path
+                # owns the coroutine) rather than as a hard run_async timeout.
+                return await self._await_with_idle_deadline(
+                    self._do_acp_prompt(prompt_blocks), cancel_on_exit=True
+                )
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = self._executor.run_async(
-                        _prompt, timeout=self.acp_prompt_timeout
-                    )
+                    response = self._executor.run_async(_prompt)
                     break
                 except TimeoutError:
                     raise
@@ -3081,7 +3105,7 @@ class ACPAgent(AgentBase):
         prompt_future: Future[PromptResponse | None] | None = None
         try:
             logger.info(
-                "Sending ACP prompt (timeout=%.0fs, blocks=%d, async)",
+                "Sending ACP prompt (idle_timeout=%.0fs, blocks=%d, async)",
                 self.acp_prompt_timeout,
                 len(prompt_blocks),
             )
