@@ -41,13 +41,22 @@ def test_switch_openhands_to_acp_replaces_with_fresh_variant() -> None:
 
 @pytest.mark.parametrize(
     "diff",
-    [{"agent_kind": "acp"}, {"agent_kind": "acp", "agent_context": None}],
+    [{"agent_kind": "acp", "agent_context": None}],
 )
 def test_switch_openhands_to_acp_requires_agent_context(diff) -> None:
     base = {"agent_kind": "openhands", "llm": {"model": "gpt"}}
 
-    with pytest.raises(ValueError, match="agent_context is required"):
+    with pytest.raises(ValueError, match="agent_context cannot be null"):
         apply_agent_settings_diff(base, diff)
+
+
+def test_switch_openhands_to_acp_defaults_missing_agent_context() -> None:
+    base = {"agent_kind": "openhands", "llm": {"model": "gpt"}}
+
+    result = apply_agent_settings_diff(base, {"agent_kind": "acp"})
+
+    assert isinstance(result, ACPAgentSettings)
+    assert result.agent_context is not None
 
 
 def test_switch_acp_to_openhands_replaces_with_fresh_variant() -> None:

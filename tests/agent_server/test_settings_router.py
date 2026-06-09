@@ -1033,7 +1033,6 @@ def test_patch_settings_switch_agent_kind_from_openhands_to_acp(client_with_sett
 @pytest.mark.parametrize(
     "agent_settings_diff",
     [
-        {"agent_kind": "acp"},
         {"agent_kind": "acp", "agent_context": None},
     ],
 )
@@ -1056,6 +1055,20 @@ def test_patch_settings_switch_to_acp_requires_agent_context(
     persisted = json.loads((temp_persistence_dir / "settings.json").read_text())
     assert persisted["agent_settings"]["agent_kind"] == "openhands"
     assert persisted["agent_settings"]["llm"]["model"] == "stable-model"
+
+
+def test_patch_settings_switch_to_acp_defaults_missing_agent_context(
+    client_with_settings,
+):
+    response = client_with_settings.patch(
+        "/api/settings",
+        json={"agent_settings_diff": {"agent_kind": "acp"}},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["agent_settings"]["agent_kind"] == "acp"
+    assert body["agent_settings"]["agent_context"] is not None
 
 
 def test_patch_settings_same_kind_restated_still_deep_merges(client_with_settings):
