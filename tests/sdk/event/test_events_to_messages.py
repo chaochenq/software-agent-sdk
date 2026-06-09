@@ -586,3 +586,159 @@ class TestEventsToMessages:
         assert msgs[0].role == "assistant"
         assert msgs[1].role == "tool"
         assert msgs[1].tool_call_id == "call_ne"
+
+
+class TestThoughtSignatureStripping:
+    """Vertex Gemini ``thoughtSignature`` blobs must be dropped from history.
+
+    LiteLLM smuggles Gemini's thought signature through the OpenAI-shaped
+    tool_call id as ``call_<hex>__thought__<base64-blob>``. The signature is
+    only consumed by the *immediately following* tool-result turn so the
+    model can resume reasoning; on every turn after that it is dead weight.
+
+    These tests pin the behaviour of the strip pass that lives at the bottom
+    of ``events_to_messages``.
+    """
+
+    @staticmethod
+    def _make_pair(turn: int, has_sig: bool = True) -> list[LLMConvertibleEvent]:
+        """Create one action+observation pair for turn ``turn``."""
+        canonical = f"call_{turn:032x}"
+        tcid = f"{canonical}__thought__{'A' * 1000}" if has_sig else canonical
+        action = create_action_event(
+            thought_text=f"thinking about turn {turn}",
+            tool_name="terminal",
+            tool_call_id=tcid,
+            llm_response_id=f"resp_{turn}",
+            action_args={"command": f"echo {turn}"},
+        )
+        observation = ObservationEvent(
+            source="environment",
+            tool_name="terminal",
+            tool_call_id=tcid,
+            observation=EventsToMessagesMockObservation(result=f"out {turn}"),
+            action_id=action.id,
+        )
+        return cast(list[LLMConvertibleEvent], [action, observation])
+
+    def test_strips_signature_from_older_turns(self):
+        """Signatures on earlier turns are removed; the latest turn is kept."""
+        events: list[LLMConvertibleEvent] = []
+        for turn in range(3):
+            events.extend(self._make_pair(turn))
+
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        # 3 assistant + 3 tool messages
+        assert [m.role for m in messages] == [
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+
+        # The two older assistant turns lose their signature; the latest keeps it.
+        assert messages[0].tool_calls is not None
+        assert "__thought__" not in messages[0].tool_calls[0].id
+        assert messages[2].tool_calls is not None
+        assert "__thought__" not in messages[2].tool_calls[0].id
+        assert messages[4].tool_calls is not None
+        assert "__thought__" in messages[4].tool_calls[0].id
+
+        # And the tool-result ids are stripped consistently with their pair.
+        assert "__thought__" not in (messages[1].tool_call_id or "")
+        assert "__thought__" not in (messages[3].tool_call_id or "")
+        assert "__thought__" in (messages[5].tool_call_id or "")
+
+    def test_stripped_pairs_stay_consistent(self):
+        """A tool-result id must equal its assistant tool_call id after stripping."""
+        events: list[LLMConvertibleEvent] = []
+        for turn in range(4):
+            events.extend(self._make_pair(turn))
+
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        for assistant, tool in zip(messages[0::2], messages[1::2], strict=True):
+            assert assistant.tool_calls is not None
+            assert assistant.tool_calls[0].id == tool.tool_call_id
+
+    def test_does_not_mutate_source_events(self):
+        """Stripping must not corrupt the underlying ActionEvent.tool_call.id."""
+        events = self._make_pair(0) + self._make_pair(1)
+        original_first_action = events[0]
+        assert isinstance(original_first_action, ActionEvent)
+        original_id = original_first_action.tool_call.id
+
+        LLMConvertibleEvent.events_to_messages(events)
+
+        # The event's tool_call id is unchanged after conversion.
+        assert original_first_action.tool_call.id == original_id
+        assert "__thought__" in original_id
+
+    def test_no_op_for_non_gemini_ids(self):
+        """Ids without ``__thought__`` are returned byte-for-byte unchanged."""
+        events: list[LLMConvertibleEvent] = []
+        for turn in range(3):
+            events.extend(self._make_pair(turn, has_sig=False))
+
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        for assistant, tool in zip(messages[0::2], messages[1::2], strict=True):
+            assert assistant.tool_calls is not None
+            assert assistant.tool_calls[0].id.startswith("call_")
+            assert assistant.tool_calls[0].id == tool.tool_call_id
+            assert "__thought__" not in assistant.tool_calls[0].id
+
+    def test_parallel_tool_calls_share_signature_keep_window(self):
+        """Multiple tool calls in the same LLM response are kept together."""
+        # Two ActionEvents with the SAME llm_response_id = parallel tool calls.
+        sig = "__thought__" + "B" * 500
+        action_a = create_action_event(
+            thought_text="parallel",
+            tool_name="terminal",
+            tool_call_id=f"call_aaaa{sig}",
+            llm_response_id="resp_parallel",
+            action_args={"command": "a"},
+        )
+        # Batched siblings must carry no thought of their own.
+        action_b = create_action_event(
+            thought_text="",
+            tool_name="terminal",
+            tool_call_id=f"call_bbbb{sig}",
+            llm_response_id="resp_parallel",
+            action_args={"command": "b"},
+        )
+        # ``create_action_event`` always emits a thought; clear it for B.
+        action_b = action_b.model_copy(update={"thought": []})
+        obs_a = ObservationEvent(
+            source="environment",
+            tool_name="terminal",
+            tool_call_id=f"call_aaaa{sig}",
+            observation=EventsToMessagesMockObservation(result="a-out"),
+            action_id=action_a.id,
+        )
+        obs_b = ObservationEvent(
+            source="environment",
+            tool_name="terminal",
+            tool_call_id=f"call_bbbb{sig}",
+            observation=EventsToMessagesMockObservation(result="b-out"),
+            action_id=action_b.id,
+        )
+
+        events = cast(
+            list[LLMConvertibleEvent],
+            [action_a, action_b, obs_a, obs_b],
+        )
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        # Combined assistant + two tool messages
+        assert messages[0].role == "assistant"
+        assert messages[0].tool_calls is not None
+        # Both parallel calls keep their signatures because they are part of
+        # the most-recent assistant turn.
+        assert all("__thought__" in tc.id for tc in messages[0].tool_calls)
+        # Tool-result ids match the kept signatures verbatim.
+        assert messages[1].tool_call_id == messages[0].tool_calls[0].id
+        assert messages[2].tool_call_id == messages[0].tool_calls[1].id

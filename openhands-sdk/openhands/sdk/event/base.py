@@ -135,6 +135,11 @@ class LLMConvertibleEvent(Event, ABC):
                     messages.append(msg)
                 i += 1
 
+        # Vertex Gemini thought signatures (``call_..__thought__<blob>``) are only
+        # consumed on the immediately following tool-result turn. Strip them from
+        # archival history so they aren't re-shipped in every subsequent prompt.
+        _strip_archival_thought_signatures(messages)
+
         return messages
 
 
@@ -174,3 +179,57 @@ def _combine_action_events(events: list["ActionEvent"]) -> Message:
         reasoning_content=events[0].reasoning_content,  # Shared reasoning content
         thinking_blocks=events[0].thinking_blocks,  # Shared thinking blocks
     )
+
+
+def _strip_archival_thought_signatures(messages: list[Message]) -> None:
+    """Drop Vertex Gemini thought-signature suffixes from archival history.
+
+    Vertex returns a ``thoughtSignature`` on each turn that uses reasoning, and
+    LiteLLM smuggles it through the OpenAI-shaped tool call id as
+    ``call_<hex>__thought__<base64-blob>``. The signature is only consumed by
+    the *immediately following* tool-result turn so the model can resume from
+    its prior reasoning state — after that turn it is dead weight that the
+    SDK would otherwise re-ship in every subsequent prompt.
+
+    This helper keeps the signature on the most recent assistant turn with
+    tool calls (and on the matching tool-result messages) and strips it from
+    all earlier turns. Tool-call ids on assistant and tool messages are
+    always stripped together so the pairs stay consistent.
+
+    Non-Gemini ids are unaffected: stripping looks for the literal
+    ``__thought__`` marker and is a no-op when absent.
+    """
+    from openhands.sdk.llm import MessageToolCall
+    from openhands.sdk.llm.utils.thought_signature import (
+        has_thought_signature,
+        strip_thought_signature,
+    )
+
+    # Find the ids on the most recent assistant turn that issued tool calls.
+    keep_ids: set[str] = set()
+    for message in reversed(messages):
+        if message.role == "assistant" and message.tool_calls:
+            keep_ids = {tc.id for tc in message.tool_calls}
+            break
+
+    for message in messages:
+        if message.role == "assistant" and message.tool_calls:
+            new_calls: list[MessageToolCall] = []
+            mutated = False
+            for tc in message.tool_calls:
+                if tc.id in keep_ids or not has_thought_signature(tc.id):
+                    new_calls.append(tc)
+                else:
+                    new_calls.append(
+                        tc.model_copy(update={"id": strip_thought_signature(tc.id)})
+                    )
+                    mutated = True
+            if mutated:
+                message.tool_calls = new_calls
+        elif (
+            message.role == "tool"
+            and message.tool_call_id
+            and message.tool_call_id not in keep_ids
+            and has_thought_signature(message.tool_call_id)
+        ):
+            message.tool_call_id = strip_thought_signature(message.tool_call_id)
