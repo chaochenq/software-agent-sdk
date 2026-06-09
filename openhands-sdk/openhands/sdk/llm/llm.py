@@ -112,6 +112,11 @@ from openhands.sdk.llm.utils.image_resize import maybe_resize_messages_for_provi
 from openhands.sdk.llm.utils.litellm_provider import LLMProvider
 from openhands.sdk.llm.utils.metrics import Metrics
 from openhands.sdk.llm.utils.model_features import get_features
+from openhands.sdk.llm.utils.openhands_provider import (
+    LiteLLMCallKwargs,
+    canonicalize_openhands_llm_payload,
+    litellm_call_kwargs,
+)
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
@@ -532,14 +537,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         if model_val.startswith("azure") and not d.get("api_version"):
             d["api_version"] = "2024-12-01-preview"
 
-        # Provider rewrite: openhands/* -> litellm_proxy/*
-        if model_val.startswith("openhands/"):
-            model_name = model_val.removeprefix("openhands/")
-            d["model"] = f"litellm_proxy/{model_name}"
-            # Set base_url (default to the app proxy when base_url is unset or None)
-            # Use `or` instead of dict.get() to handle explicit None values
-            d["base_url"] = d.get("base_url") or "https://llm-proxy.app.all-hands.dev/"
-
         # Fix base_url for direct OpenAI - API expects /v1 suffix
         # If base_url is "https://api.openai.com", set to None to use LiteLLM default
         if model_val.startswith("openai/"):
@@ -581,9 +578,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             self._tokenizer = create_pretrained_tokenizer(self.custom_tokenizer)
 
         # LiteLLM-facing provider parsing is fixed for the lifetime of this LLM.
+        call_kwargs = self._litellm_call_kwargs()
         self._provider_info = LLMProvider.from_model(
-            model=self.model,
-            api_base=self.base_url,
+            model=call_kwargs["model"],
+            api_base=call_kwargs["api_base"],
         )
 
         # Capabilities + model info
@@ -847,7 +845,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "input": typed_input,
             "instructions": instructions,
             "tools": resp_tools,
-            "api_base": self.base_url,
+            "api_base": provider_info.resolved_api_base,
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -1731,6 +1729,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     # Transport + helpers
     # =========================================================================
 
+    def _litellm_call_kwargs(self) -> LiteLLMCallKwargs:
+        return litellm_call_kwargs(self.model, self.base_url)
+
     def _infer_litellm_provider(self) -> str | None:
         provider_info = self._provider_info
         if provider_info is None:
@@ -1801,16 +1802,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             kwargs.setdefault("stream_options", {"include_usage": True})
         provider_info = self._provider_info
         assert provider_info is not None
-        return dict(
+        return {
             **provider_info.as_litellm_call_kwargs(api_key=self._get_api_key_value()),
-            api_base=self.base_url,
-            api_version=self.api_version,
-            timeout=self.timeout,
-            drop_params=self.drop_params,
-            seed=self.seed,
-            messages=messages,
-            **{**self._aws_kwargs(), **kwargs},
-        )
+            "api_base": provider_info.resolved_api_base,
+            "api_version": self.api_version,
+            "timeout": self.timeout,
+            "drop_params": self.drop_params,
+            "seed": self.seed,
+            "messages": messages,
+            **self._aws_kwargs(),
+            **kwargs,
+        }
 
     def _transport_call(
         self,
@@ -2101,8 +2103,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 # Single block: mark it for caching
                 sys_content[0].cache_prompt = True
 
-        # Anthropic and Gemini both use these cache_control markers. LiteLLM
-        # performs the provider-specific cache setup for Gemini downstream.
+        # Second breakpoint: mark the last user/tool message so the cached prefix
+        # extends every turn. Anthropic-only; Gemini is excluded from
+        # PROMPT_CACHE_MODELS because its cache can't extend this way.
         for message in reversed(messages):
             if message.role in ("user", "tool"):
                 message.content[
@@ -2341,6 +2344,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
 
         payload.pop("schema_version", None)
+        payload = canonicalize_openhands_llm_payload(payload)
         return cls.model_validate(payload, context=context)
 
     def to_persisted(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:

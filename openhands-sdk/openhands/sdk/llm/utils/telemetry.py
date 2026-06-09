@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from openhands.sdk.llm.utils.litellm_provider import LLMProvider
 from openhands.sdk.llm.utils.metrics import Metrics
+from openhands.sdk.llm.utils.openhands_provider import litellm_call_kwargs
 from openhands.sdk.logger import get_logger
 
 
@@ -270,8 +271,11 @@ class Telemetry(BaseModel):
         except Exception as e:
             logger.debug(f"Failed to get cost from LiteLLM headers: {e}")
 
-        # move on to litellm cost calculator
-        provider_info = LLMProvider.from_model(model=self.model_name, api_base=None)
+        call_kwargs = litellm_call_kwargs(self.model_name, None)
+        provider_info = LLMProvider.from_model(
+            model=call_kwargs["model"],
+            api_base=call_kwargs["api_base"],
+        )
         extra_kwargs.update(provider_info.as_litellm_call_kwargs())
         try:
             return float(

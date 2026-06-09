@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, cast
@@ -11,6 +13,9 @@ with warnings.catch_warnings():
     import litellm
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,7 +43,12 @@ class LLMProvider:
                     api_key=None,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Failed to parse LiteLLM provider for model=%s: %s",
+                model,
+                exc,
+            )
             parsed_model = model
             provider_name = None
             resolved_api_base = api_base
@@ -99,24 +109,26 @@ class LLMProvider:
             kwargs["api_key"] = normalized_api_key
         return kwargs
 
+    @staticmethod
+    def _api_base_or_none(getter: Callable[[], Any]) -> str | None:
+        try:
+            api_base = getter()
+        except Exception:
+            return None
+        if not api_base:
+            return None
+        return cast(str, api_base)
+
     def infer_api_base(self) -> str | None:
         """Infer a provider API base without reimplementing provider logic."""
-        try:
-            get_api_base = cast(Any, litellm).get_api_base
-            api_base = get_api_base(self.canonical_name, {})
-            if api_base:
-                return cast(str, api_base)
-        except Exception:
-            pass
+        get_api_base = cast(Any, litellm).get_api_base
+        api_base = self._api_base_or_none(lambda: get_api_base(self.canonical_name, {}))
+        if api_base:
+            return api_base
 
         if self.model_info is not None and hasattr(self.model_info, "get_api_base"):
-            try:
-                api_base = self.model_info.get_api_base()
-            except NotImplementedError:
-                api_base = None
-            except Exception:
-                api_base = None
+            api_base = self._api_base_or_none(self.model_info.get_api_base)
             if api_base:
-                return cast(str, api_base)
+                return api_base
 
         return self.resolved_api_base
