@@ -670,6 +670,7 @@ def test_gemini_3_5_flash_config():
     assert model["display_name"] == "Gemini 3.5 Flash"
     assert model["llm_config"]["model"] == "litellm_proxy/gemini-3.5-flash"
     assert model["llm_config"]["temperature"] == 0.0
+    assert model["llm_config"]["inline_image_urls"] is True
 
 
 def test_gpt_oss_120b_config():
@@ -690,6 +691,20 @@ def test_nemotron_3_ultra_550b_a55b_config():
     assert model["id"] == "nemotron-3-ultra-550b-a55b"
     assert model["display_name"] == "NVIDIA Nemotron-3 Ultra 550B"
     assert model["llm_config"]["model"] == "litellm_proxy/nemotron-3-ultra-550b-a55b"
+    assert model["llm_config"]["temperature"] == 1.0
+    assert model["llm_config"]["top_p"] == 0.95
+
+
+def test_nemotron_3_ultra_550b_a55b_or_paid_config():
+    """Test nemotron-3-ultra-550b-a55b-or-paid (paid OpenRouter route) config."""
+    model = MODELS["nemotron-3-ultra-550b-a55b-or-paid"]
+
+    assert model["id"] == "nemotron-3-ultra-550b-a55b-or-paid"
+    assert model["display_name"] == "NVIDIA Nemotron-3 Ultra 550B (OpenRouter, paid)"
+    assert (
+        model["llm_config"]["model"]
+        == "litellm_proxy/nemotron-3-ultra-550b-a55b-or-paid"
+    )
     assert model["llm_config"]["temperature"] == 1.0
     assert model["llm_config"]["top_p"] == 0.95
 

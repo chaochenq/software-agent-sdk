@@ -4,6 +4,8 @@ from functools import cache
 
 from litellm import get_supported_openai_params
 
+from openhands.sdk.llm.utils.openhands_provider import OPENHANDS_PROVIDER_PREFIX
+
 
 def model_matches(model: str, patterns: Iterable[str]) -> bool:
     """Return True if any pattern appears as a substring in the raw model name.
@@ -69,8 +71,10 @@ def _normalized_supported_openai_params(model: str | None) -> frozenset[str]:
         return frozenset()
 
     normalized = model.strip().lower()
-    if normalized.startswith(LITELLM_PROXY_PREFIX):
-        normalized = normalized.removeprefix(LITELLM_PROXY_PREFIX)
+    for provider_prefix in (LITELLM_PROXY_PREFIX, OPENHANDS_PROVIDER_PREFIX):
+        if normalized.startswith(provider_prefix):
+            normalized = normalized.removeprefix(provider_prefix)
+            break
 
     # Strip deployment prefixes (e.g., "prod/", "dev/", "staging/", "test/")
     for prefix in DEPLOYMENT_PREFIXES:
@@ -117,10 +121,9 @@ PROMPT_CACHE_MODELS: list[str] = [
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-sonnet-4-6",
-    # Gemini uses the same cache_control marker format. LiteLLM handles
-    # Vertex/Gemini context-cache creation when these markers are present.
-    "gemini-2.5",
-    "gemini-3",
+    # Do NOT add Gemini: explicit cache_control markers freeze its cache at the
+    # static prefix and disable Google's implicit caching on the growing body
+    # (~6-14x cost). Gemini uses implicit prefix caching instead.
 ]
 
 # Models that support a top-level prompt_cache_retention parameter

@@ -171,6 +171,14 @@ MODELS = {
         "llm_config": {
             "model": "litellm_proxy/gemini-3.5-flash",
             "temperature": 0.0,
+            # SWE-bench Multimodal runs against this model fail ~97% of
+            # image-bearing instances with an opaque Vertex 500
+            # "Internal error encountered" on the very first LLM call,
+            # while text-only instances complete normally. Fetching the
+            # image client-side and sending it as a base64 ``data:`` URL
+            # bypasses LiteLLM's server-side URL fetch path, which is the
+            # most plausible failure point. See run #26931958101 analysis.
+            "inline_image_urls": True,
         },
     },
     "gpt-5.2": {
@@ -371,6 +379,18 @@ MODELS = {
         "display_name": "NVIDIA Nemotron-3 Ultra 550B",
         "llm_config": {
             "model": "litellm_proxy/nemotron-3-ultra-550b-a55b",
+            "temperature": 1.0,
+            "top_p": 0.95,
+        },
+    },
+    # Paid OpenRouter route (no training, smaller 262k context):
+    # https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+    # Backed by the `nemotron-3-ultra-550b-a55b-or-paid` model on the LiteLLM proxy.
+    "nemotron-3-ultra-550b-a55b-or-paid": {
+        "id": "nemotron-3-ultra-550b-a55b-or-paid",
+        "display_name": "NVIDIA Nemotron-3 Ultra 550B (OpenRouter, paid)",
+        "llm_config": {
+            "model": "litellm_proxy/nemotron-3-ultra-550b-a55b-or-paid",
             "temperature": 1.0,
             "top_p": 0.95,
         },

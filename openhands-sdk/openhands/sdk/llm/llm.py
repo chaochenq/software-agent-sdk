@@ -87,6 +87,7 @@ from litellm.utils import (
 from openhands.sdk.llm.exceptions import (
     LLMContextWindowTooSmallError,
     LLMNoResponseError,
+    is_prompt_cache_too_small,
     map_provider_exception,
 )
 
@@ -111,6 +112,11 @@ from openhands.sdk.llm.utils.image_resize import maybe_resize_messages_for_provi
 from openhands.sdk.llm.utils.litellm_provider import infer_litellm_provider
 from openhands.sdk.llm.utils.metrics import Metrics
 from openhands.sdk.llm.utils.model_features import get_features
+from openhands.sdk.llm.utils.openhands_provider import (
+    LiteLLMCallKwargs,
+    canonicalize_openhands_llm_payload,
+    litellm_call_kwargs,
+)
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
@@ -531,14 +537,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         if model_val.startswith("azure") and not d.get("api_version"):
             d["api_version"] = "2024-12-01-preview"
 
-        # Provider rewrite: openhands/* -> litellm_proxy/*
-        if model_val.startswith("openhands/"):
-            model_name = model_val.removeprefix("openhands/")
-            d["model"] = f"litellm_proxy/{model_name}"
-            # Set base_url (default to the app proxy when base_url is unset or None)
-            # Use `or` instead of dict.get() to handle explicit None values
-            d["base_url"] = d.get("base_url") or "https://llm-proxy.app.all-hands.dev/"
-
         # Fix base_url for direct OpenAI - API expects /v1 suffix
         # If base_url is "https://api.openai.com", set to None to use LiteLLM default
         if model_val.startswith("openai/"):
@@ -833,14 +831,12 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         typed_input: ResponseInputParam | str = (
             cast(ResponseInputParam, input_items) if input_items else ""
         )
-        api_key_value = self._get_litellm_api_key_value()
         return {
-            "model": self.model,
+            **self._litellm_call_kwargs(),
             "input": typed_input,
             "instructions": instructions,
             "tools": resp_tools,
-            "api_key": api_key_value,
-            "api_base": self.base_url,
+            "api_key": self._get_litellm_api_key_value(),
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -1269,6 +1265,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 removed_in="1.29.0",
                 details=_RETURN_METRICS_DETAILS,
             )
+        _caller_kwargs = kwargs.copy()
         enable_streaming = bool(kwargs.get("stream", False)) or self.stream
         if enable_streaming:
             if on_token is None:
@@ -1308,6 +1305,22 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         try:
             return self._build_completion_result(_one_attempt())
         except Exception as e:
+            # If the prompt cache content is too small for the provider's
+            # minimum token threshold (e.g., Vertex AI requires ≥4096 tokens),
+            # retry without prompt caching markers.
+            if is_prompt_cache_too_small(e) and self.is_caching_prompt_active():
+                logger.warning(
+                    "Prompt cache content too small for provider minimum, "
+                    "retrying without prompt caching"
+                )
+                no_cache_llm = self.model_copy(update={"caching_prompt": False})
+                return no_cache_llm.completion(
+                    messages,
+                    tools,
+                    add_security_risk_prediction=add_security_risk_prediction,
+                    on_token=on_token,
+                    **_caller_kwargs,
+                )
             return self._handle_error(
                 e,
                 lambda fb: fb.completion(
@@ -1315,6 +1328,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     tools,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=on_token,
+                    **_caller_kwargs,
                 ),
             )
 
@@ -1342,6 +1356,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 removed_in="1.29.0",
                 details=_RETURN_METRICS_DETAILS,
             )
+        _caller_kwargs = kwargs.copy()
         enable_streaming = bool(kwargs.get("stream", False)) or self.stream
         if enable_streaming:
             if on_token is None:
@@ -1381,6 +1396,22 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         try:
             return self._build_completion_result(await _one_attempt())
         except Exception as e:
+            # If the prompt cache content is too small for the provider's
+            # minimum token threshold (e.g., Vertex AI requires ≥4096 tokens),
+            # retry without prompt caching markers.
+            if is_prompt_cache_too_small(e) and self.is_caching_prompt_active():
+                logger.warning(
+                    "Prompt cache content too small for provider minimum, "
+                    "retrying without prompt caching"
+                )
+                no_cache_llm = self.model_copy(update={"caching_prompt": False})
+                return await no_cache_llm.acompletion(
+                    messages,
+                    tools,
+                    add_security_risk_prediction=add_security_risk_prediction,
+                    on_token=on_token,
+                    **_caller_kwargs,
+                )
             # Fallback is synchronous; cast the token callback since the
             # fallback LLM's sync path accepts TokenCallbackType.
             _fb_token = cast("TokenCallbackType | None", on_token)
@@ -1391,6 +1422,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     tools,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=_fb_token,
+                    **_caller_kwargs,
                 ),
             )
 
@@ -1434,6 +1466,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 removed_in="1.29.0",
                 details=_RETURN_METRICS_DETAILS,
             )
+        _caller_kwargs = kwargs.copy()
         user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
         if user_enable_streaming:
             # We allow on_token to be None for subscription mode
@@ -1512,6 +1545,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         try:
             return self._build_responses_result(_one_attempt())
         except Exception as e:
+            # If the prompt cache content is too small for the provider's
+            # minimum token threshold (e.g., Vertex AI requires ≥4096 tokens),
+            # retry without prompt caching markers.
+            if is_prompt_cache_too_small(e) and self.is_caching_prompt_active():
+                logger.warning(
+                    "Prompt cache content too small for provider minimum, "
+                    "retrying without prompt caching"
+                )
+                no_cache_llm = self.model_copy(update={"caching_prompt": False})
+                return no_cache_llm.responses(
+                    messages,
+                    tools,
+                    include,
+                    store,
+                    add_security_risk_prediction=add_security_risk_prediction,
+                    on_token=on_token,
+                    **_caller_kwargs,
+                )
             return self._handle_error(
                 e,
                 lambda fb: fb.responses(
@@ -1521,6 +1572,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     store,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=on_token,
+                    **_caller_kwargs,
                 ),
             )
 
@@ -1550,6 +1602,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 removed_in="1.29.0",
                 details=_RETURN_METRICS_DETAILS,
             )
+        _caller_kwargs = kwargs.copy()
         user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
         if user_enable_streaming:
             # We allow on_token to be None for subscription mode
@@ -1631,6 +1684,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         try:
             return self._build_responses_result(await _one_attempt())
         except Exception as e:
+            # If the prompt cache content is too small for the provider's
+            # minimum token threshold (e.g., Vertex AI requires ≥4096 tokens),
+            # retry without prompt caching markers.
+            if is_prompt_cache_too_small(e) and self.is_caching_prompt_active():
+                logger.warning(
+                    "Prompt cache content too small for provider minimum, "
+                    "retrying without prompt caching"
+                )
+                no_cache_llm = self.model_copy(update={"caching_prompt": False})
+                return await no_cache_llm.aresponses(
+                    messages,
+                    tools,
+                    include,
+                    store,
+                    add_security_risk_prediction=add_security_risk_prediction,
+                    on_token=on_token,
+                    **_caller_kwargs,
+                )
             _fb_token = cast("TokenCallbackType | None", on_token)
             return await self._ahandle_error(
                 e,
@@ -1641,6 +1712,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     store,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=_fb_token,
+                    **_caller_kwargs,
                 ),
             )
 
@@ -1648,11 +1720,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     # Transport + helpers
     # =========================================================================
 
+    def _litellm_call_kwargs(self) -> LiteLLMCallKwargs:
+        return litellm_call_kwargs(self.model, self.base_url)
+
     def _infer_litellm_provider(self) -> str | None:
         if self._litellm_provider is not None:
             return self._litellm_provider
 
-        provider = infer_litellm_provider(model=self.model, api_base=self.base_url)
+        call_kwargs = self._litellm_call_kwargs()
+        provider = infer_litellm_provider(
+            model=call_kwargs["model"],
+            api_base=call_kwargs["api_base"],
+        )
         self._litellm_provider = provider
         return provider
 
@@ -1722,17 +1801,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         # not silently discarded by litellm's streaming handler.
         if enable_streaming:
             kwargs.setdefault("stream_options", {"include_usage": True})
-        return dict(
-            model=self.model,
-            api_key=self._get_litellm_api_key_value(),
-            api_base=self.base_url,
-            api_version=self.api_version,
-            timeout=self.timeout,
-            drop_params=self.drop_params,
-            seed=self.seed,
-            messages=messages,
-            **{**self._aws_kwargs(), **kwargs},
-        )
+        return {
+            **self._litellm_call_kwargs(),
+            "api_key": self._get_litellm_api_key_value(),
+            "api_version": self.api_version,
+            "timeout": self.timeout,
+            "drop_params": self.drop_params,
+            "seed": self.seed,
+            "messages": messages,
+            **self._aws_kwargs(),
+            **kwargs,
+        }
 
     def _transport_call(
         self,
@@ -2023,8 +2102,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                 # Single block: mark it for caching
                 sys_content[0].cache_prompt = True
 
-        # Anthropic and Gemini both use these cache_control markers. LiteLLM
-        # performs the provider-specific cache setup for Gemini downstream.
+        # Second breakpoint: mark the last user/tool message so the cached prefix
+        # extends every turn. Anthropic-only; Gemini is excluded from
+        # PROMPT_CACHE_MODELS because its cache can't extend this way.
         for message in reversed(messages):
             if message.role in ("user", "tool"):
                 message.content[
@@ -2263,6 +2343,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
 
         payload.pop("schema_version", None)
+        payload = canonicalize_openhands_llm_payload(payload)
         return cls.model_validate(payload, context=context)
 
     def to_persisted(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:

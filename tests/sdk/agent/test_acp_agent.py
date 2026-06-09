@@ -1217,6 +1217,40 @@ class TestACPActivityHeartbeat:
         client.reset()
         assert client._last_activity_signal == 999.0
 
+    def test_idle_clock_unarmed_reports_infinite_idle(self):
+        """Before arming, the idle clock reports an unbounded gap."""
+        client = _OpenHandsACPBridge()
+        assert client.seconds_since_last_activity() == float("inf")
+
+    def test_arm_activity_clock_resets_idle(self):
+        client = _OpenHandsACPBridge()
+        client.arm_activity_clock()
+        # Just armed → effectively zero seconds since activity.
+        assert client.seconds_since_last_activity() < 1.0
+
+    @pytest.mark.asyncio
+    async def test_session_update_records_activity_for_idle_clock(self):
+        """Every session_update resets the idle clock, even when throttled.
+
+        The throttled heartbeat (_last_activity_signal) and the idle clock
+        (_last_activity_monotonic) are independent: a second update inside the
+        throttle window does not re-fire on_activity but still counts as
+        progress for the idle timeout.
+        """
+        from acp.schema import AgentThoughtChunk, TextContentBlock
+
+        client = _OpenHandsACPBridge()
+        client._last_activity_monotonic = float("-inf")
+
+        # A thought chunk does not fire the on_activity heartbeat at all, but
+        # must still count as activity for the idle clock.
+        chunk = MagicMock(spec=AgentThoughtChunk)
+        chunk.content = MagicMock(spec=TextContentBlock)
+        chunk.content.text = "thinking"
+        await client.session_update("sess-1", chunk)
+
+        assert client.seconds_since_last_activity() < 1.0
+
     @pytest.mark.asyncio
     async def test_tool_call_start_signals_activity(self):
         from acp.schema import ToolCallStart
@@ -1399,6 +1433,103 @@ class TestACPActivityHeartbeat:
         # And that it was cleared afterward so a late session_update
         # cannot fire the per-turn heartbeat callback out-of-band.
         assert agent._client.on_activity is None
+
+
+# ---------------------------------------------------------------------------
+# Prompt idle (inactivity) timeout
+# ---------------------------------------------------------------------------
+
+
+class TestACPPromptIdleTimeout:
+    """The prompt deadline is an idle timeout: ACP activity resets it.
+
+    Regression coverage for agent-canvas#1245 — long-running ACP prompts must
+    keep working as long as the agent makes progress, rather than dying at a
+    hard wall-clock deadline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_active_prompt_outlives_idle_window(self):
+        """A prompt that keeps streaming updates is not killed at the deadline.
+
+        The agent runs for well over ``acp_prompt_timeout`` of total wall-clock
+        time, but emits a ``session_update`` far more often than the idle window,
+        so the deadline keeps resetting and the prompt completes normally.
+        """
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        agent = _make_agent(acp_prompt_timeout=0.3)
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        client.arm_activity_clock()
+
+        sentinel = object()
+
+        async def _active_prompt() -> Any:
+            # ~0.5s total (> 0.3s idle window) but a tick every 0.02s
+            # (<< 0.3s), so the idle clock never elapses.
+            for _ in range(25):
+                await asyncio.sleep(0.02)
+                chunk = MagicMock(spec=AgentMessageChunk)
+                chunk.content = MagicMock(spec=TextContentBlock)
+                chunk.content.text = "tick"
+                await client.session_update("sess-1", chunk)
+            return sentinel
+
+        result = await agent._await_with_idle_deadline(
+            _active_prompt(), cancel_on_exit=True
+        )
+        assert result is sentinel
+
+    @pytest.mark.asyncio
+    async def test_silent_prompt_times_out_after_idle_window(self):
+        """A prompt that produces no activity is aborted after the idle window."""
+        agent = _make_agent(acp_prompt_timeout=0.1)
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        client.arm_activity_clock()
+
+        cancelled = asyncio.Event()
+
+        async def _silent_prompt() -> Any:
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return object()
+
+        with pytest.raises(TimeoutError, match="no activity"):
+            await agent._await_with_idle_deadline(_silent_prompt(), cancel_on_exit=True)
+
+        # The helper cancels the underlying prompt on timeout.
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_late_activity_extends_then_idle_times_out(self):
+        """Activity extends the deadline; silence after it still times out."""
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        agent = _make_agent(acp_prompt_timeout=0.15)
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        client.arm_activity_clock()
+
+        async def _active_then_silent() -> Any:
+            # One burst of activity past the first idle window...
+            await asyncio.sleep(0.1)
+            chunk = MagicMock(spec=AgentMessageChunk)
+            chunk.content = MagicMock(spec=TextContentBlock)
+            chunk.content.text = "tick"
+            await client.session_update("sess-1", chunk)
+            # ...then go silent so the (extended) idle window elapses.
+            await asyncio.sleep(5.0)
+            return object()
+
+        with pytest.raises(TimeoutError, match="no activity"):
+            await agent._await_with_idle_deadline(
+                _active_then_silent(), cancel_on_exit=True
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +2047,61 @@ class TestACPAgentAstep:
             conversation.state.execution_status == ConversationExecutionStatus.FINISHED
         )
 
+    def test_astep_active_prompt_survives_idle_window(self, tmp_path):
+        """End-to-end via the real portal: an actively-streaming prompt that
+        runs well past ``acp_prompt_timeout`` finalizes normally.
+
+        Exercises the full concurrency model — the prompt runs on the portal
+        loop while the idle watchdog polls on the caller loop, and each
+        bridge ``session_update`` (fired across the loop boundary) resets the
+        deadline. Regression coverage for agent-canvas#1245.
+        """
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        from openhands.sdk.utils.async_executor import AsyncExecutor
+
+        agent = _make_agent(acp_prompt_timeout=0.3)
+        conversation = self._make_conversation_with_message(tmp_path)
+        emitted: list = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.get_turn_usage_update = MagicMock(return_value=object())
+        agent._client = mock_client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        async def _fake_prompt(prompt_blocks, session_id):  # noqa: ARG001
+            # ~0.5s total (> 0.3s idle window), one update every 0.02s so the
+            # deadline keeps resetting; then complete the turn.
+            for _ in range(25):
+                await asyncio.sleep(0.02)
+                chunk = MagicMock(spec=AgentMessageChunk)
+                chunk.content = MagicMock(spec=TextContentBlock)
+                chunk.content.text = "tick"
+                await mock_client.session_update(session_id, chunk)
+            return None
+
+        agent._conn.prompt = _fake_prompt
+
+        executor = AsyncExecutor()
+        try:
+            agent._executor = executor
+            asyncio.run(agent.astep(conversation, on_event=emitted.append))
+        finally:
+            executor.close()
+
+        assert (
+            conversation.state.execution_status == ConversationExecutionStatus.FINISHED
+        )
+        assert not any(
+            isinstance(e, MessageEvent)
+            and any(
+                isinstance(c, TextContent) and "timed out" in c.text
+                for c in e.llm_message.content
+            )
+            for e in emitted
+        )
+
     def test_astep_emits_error_and_reraises_on_exception(self, tmp_path):
         """astep's error path must call ``_emit_turn_error`` AND re-raise.
 
@@ -1975,13 +2161,15 @@ class TestACPAgentAstep:
         )
         assert conversation.state.execution_status == ConversationExecutionStatus.ERROR
 
-    def test_astep_times_out_while_tool_call_is_inflight(self, tmp_path):
-        """A hard ACP prompt timeout still fires during an active tool call.
+    def test_astep_times_out_when_idle_with_inflight_tool_call(self, tmp_path):
+        """The idle timeout fires when a tool call hangs with no further updates.
 
-        Mirroring OpenHands command handling, active output/heartbeats keep the
-        runtime alive but do not let a never-ending command suppress the hard
-        turn deadline. The timeout path must cancel the ACP session and close
-        any streamed tool cards as failed.
+        The deadline is an inactivity timeout: a tool card that was opened but
+        then produces no further ``session_update`` (the prompt future never
+        resolves and nothing streams) is silent, so the idle window elapses and
+        the timeout path must cancel the ACP session and close the streamed tool
+        card as failed. (Ongoing activity instead resets the clock — see
+        ``TestACPPromptIdleTimeout``.)
         """
         from concurrent.futures import Future
 
@@ -5926,12 +6114,13 @@ class TestACPSecretsEnvInjection:
     """Tests for secret injection into the ACP subprocess environment.
 
     Secrets passed via ``agent_context.secrets`` must land in the subprocess
-    env so the ACP server (Claude Code, Codex CLI, etc.) can use them. This
-    drain is the only thing that delivers ``agent_context.secrets`` to the CLI
-    on paths that don't call ``create_request`` (e.g. canvas-local, which folds
-    ``llm.api_key`` into ``agent_context.secrets`` server-side via
-    ``create_agent`` but never lifts it into ``state.secret_registry``).
-    ``acp_env`` entries take precedence over agent_context secrets.
+    env so the ACP server (Claude Code, Codex CLI, etc.) can use them. They
+    reach the subprocess through ``state.secret_registry``: ``LocalConversation``
+    seeds ``agent_context.secrets`` into the registry at init (covering
+    canvas-local, which folds ``llm.api_key`` into ``agent_context.secrets``
+    server-side via ``create_agent`` but never lifts it into ``request.secrets``),
+    and ``_start_acp_server`` injects the registry. ``acp_env`` entries take
+    precedence over registry secrets.
     """
 
     @staticmethod
@@ -5954,8 +6143,13 @@ class TestACPSecretsEnvInjection:
         return conn
 
     @staticmethod
-    def _run_start_capturing_env(agent, tmp_path) -> dict:
-        """Run _start_acp_server and return the env dict passed to the subprocess."""
+    def _run_start_capturing_env(agent, tmp_path, *, state=None) -> dict:
+        """Run _start_acp_server and return the env dict passed to the subprocess.
+
+        Pass ``state`` to run against a conversation-seeded registry (e.g. one
+        built via ``LocalConversation`` so ``agent_context.secrets`` are lifted
+        in); otherwise a bare state is used.
+        """
         from contextlib import ExitStack
 
         from openhands.sdk.utils.async_executor import AsyncExecutor
@@ -5974,14 +6168,15 @@ class TestACPSecretsEnvInjection:
         async def _fake_filter(_src, _dst):
             return None
 
-        state = _make_state(tmp_path)
+        if state is None:
+            state = _make_state(tmp_path)
         agent._executor = AsyncExecutor()
 
         with ExitStack() as stack:
             # Hermetic: exclude the runner's ambient env (e.g. a real
             # GITHUB_TOKEN / ANTHROPIC_API_KEY) so it can't shadow the
-            # registry/drain values under test — env.update(os.environ) runs
-            # before the fill-if-absent secret tiers in _start_acp_server.
+            # registry values under test — env.update(os.environ) runs
+            # before the fill-if-absent registry tier in _start_acp_server.
             stack.enter_context(patch.dict("os.environ", {}, clear=True))
             stack.enter_context(
                 patch(
@@ -6012,14 +6207,19 @@ class TestACPSecretsEnvInjection:
         return captured
 
     def test_static_secret_injected_into_subprocess_env(self, tmp_path):
-        """A StaticSecret in agent_context.secrets lands in the subprocess env.
+        """A StaticSecret in agent_context.secrets reaches the subprocess env.
 
-        This drain is what delivers ``agent_context.secrets`` to the CLI on
-        paths that don't lift them into ``state.secret_registry`` via
+        ``LocalConversation`` seeds ``agent_context.secrets`` into
+        ``state.secret_registry`` at init, and ``_start_acp_server`` injects the
+        registry — the path that delivers ``agent_context.secrets`` to the CLI
+        for callers that don't lift them into ``request.secrets`` via
         ``create_request`` (e.g. canvas-local).
         """
         from pydantic import SecretStr
 
+        from openhands.sdk.conversation.impl.local_conversation import (
+            LocalConversation,
+        )
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
@@ -6032,13 +6232,24 @@ class TestACPSecretsEnvInjection:
                 }
             )
         )
-        env = self._run_start_capturing_env(agent, tmp_path)
+        conv = LocalConversation(agent, workspace=str(tmp_path))
+        try:
+            env = self._run_start_capturing_env(agent, tmp_path, state=conv.state)
+        finally:
+            conv.close()
         assert env.get("GITHUB_TOKEN") == "ghp_test123"
 
     def test_acp_env_takes_precedence_over_agent_context_secret(self, tmp_path):
-        """An explicit acp_env entry wins over the same key in agent_context.secrets."""
+        """An explicit acp_env entry wins over the same key in agent_context.secrets.
+
+        ``agent_context.secrets`` reach env via the registry (seeded at
+        ``LocalConversation.__init__``); ``acp_env`` is applied last and wins.
+        """
         from pydantic import SecretStr
 
+        from openhands.sdk.conversation.impl.local_conversation import (
+            LocalConversation,
+        )
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
@@ -6047,8 +6258,12 @@ class TestACPSecretsEnvInjection:
                 secrets={"MY_TOKEN": StaticSecret(value=SecretStr("secret-panel"))}
             ),
         )
-        with pytest.warns(DeprecationWarning, match=r"ACPAgent\.acp_env"):
-            env = self._run_start_capturing_env(agent, tmp_path)
+        conv = LocalConversation(agent, workspace=str(tmp_path))
+        try:
+            with pytest.warns(DeprecationWarning, match=r"ACPAgent\.acp_env"):
+                env = self._run_start_capturing_env(agent, tmp_path, state=conv.state)
+        finally:
+            conv.close()
         assert env.get("MY_TOKEN") == "acp-env-wins"
 
     def test_none_value_secret_not_injected(self, tmp_path):
@@ -6121,22 +6336,28 @@ class TestACPSecretRegistryEnvInjection:
     Secrets registered via ``Conversation.update_secrets()`` — or the
     equivalent ``payload.secrets`` channel that app-server callers
     (agent-canvas, the OpenHands cloud app server) use — must land in the
-    ACP subprocess env without each caller having to also build an
-    ``AgentContext(secrets=...)`` shim around the same data.
+    ACP subprocess env. ``agent_context.secrets`` are seeded into the same
+    registry at ``LocalConversation.__init__`` (below ``request.secrets``), so
+    the registry is the single channel ``_start_acp_server`` injects from.
 
-    Same-key precedence is
-    ``acp_env > secret_registry > agent_context.secrets > os.environ``.
-    Conversation secrets (registry + the agent_context drain) override ambient
-    ``os.environ`` so an explicit per-conversation/provider secret wins over a
-    same-named server env var; the registry wins over the drain on collision.
+    Same-key precedence is ``acp_env > secret_registry > os.environ``.
+    Registry secrets override ambient ``os.environ`` so an explicit
+    per-conversation/provider secret wins over a same-named server env var.
     """
 
     @staticmethod
     def _run_start_capturing_env(
-        agent, tmp_path, *, registry_secrets=None, extra_os_env=None
+        agent, tmp_path, *, registry_secrets=None, extra_os_env=None, state=None
     ) -> dict:
-        """Re-uses the env-capture harness from TestACPSecretsEnvInjection."""
-        state = _make_state(tmp_path)
+        """Re-uses the env-capture harness from TestACPSecretsEnvInjection.
+
+        Pass ``state`` to run against a conversation-seeded registry (e.g. one
+        built via ``LocalConversation`` so ``agent_context.secrets`` are lifted
+        in); otherwise a bare state is used and ``registry_secrets`` are applied
+        directly.
+        """
+        if state is None:
+            state = _make_state(tmp_path)
         if registry_secrets:
             state.secret_registry.update_secrets(registry_secrets)
 
@@ -6254,18 +6475,22 @@ class TestACPSecretRegistryEnvInjection:
         assert env.get("GITHUB_TOKEN") == "from-acp-env"
         assert secret.calls == []
 
-    def test_registry_secret_takes_precedence_over_agent_context_secret(self, tmp_path):
-        """``secret_registry`` wins over ``agent_context.secrets`` on collision.
+    def test_request_secret_wins_and_context_only_secret_still_reaches_env(
+        self, tmp_path
+    ):
+        """request.secrets win on collision; a context-only key still reaches env.
 
-        Precedence: ``acp_env > secret_registry > agent_context.secrets >
-        os.environ``. The registry is the canonical conversation-secret channel
-        (``StartConversationRequest.secrets`` lands here). On a key collision the
-        registry value is used (the drain skips keys the registry will set); a
-        context-only key is still injected by the drain — proving the two
-        channels coexist without double-injecting.
+        Both channels flow through ``state.secret_registry``: ``LocalConversation``
+        seeds ``agent_context.secrets`` first, then ``request.secrets`` overwrite
+        colliding keys. A key present only in ``agent_context.secrets`` still
+        lands in the registry — and therefore the subprocess env — proving the
+        two channels coexist without one dropping the other.
         """
         from pydantic import SecretStr
 
+        from openhands.sdk.conversation.impl.local_conversation import (
+            LocalConversation,
+        )
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
@@ -6276,12 +6501,16 @@ class TestACPSecretRegistryEnvInjection:
                 }
             )
         )
-        env = self._run_start_capturing_env(
+        conv = LocalConversation(
             agent,
-            tmp_path,
-            registry_secrets={"GITHUB_TOKEN": "from-registry"},
+            workspace=str(tmp_path),
+            secrets={"GITHUB_TOKEN": StaticSecret(value=SecretStr("from-request"))},
         )
-        assert env.get("GITHUB_TOKEN") == "from-registry"
+        try:
+            env = self._run_start_capturing_env(agent, tmp_path, state=conv.state)
+        finally:
+            conv.close()
+        assert env.get("GITHUB_TOKEN") == "from-request"
         assert env.get("CONTEXT_ONLY") == "ctx-value"
 
     def test_empty_registry_does_not_change_behaviour(self, tmp_path):
@@ -6324,9 +6553,17 @@ class TestACPSecretRegistryEnvInjection:
         assert env.get("ANTHROPIC_API_KEY") == "from-registry"
 
     def test_agent_context_secret_overrides_ambient_os_environ(self, tmp_path):
-        """An agent_context.secrets drain value overrides ambient os.environ."""
+        """An agent_context secret (seeded into the registry) beats ambient os.environ.
+
+        ``LocalConversation`` lifts ``agent_context.secrets`` into the registry,
+        and registry secrets override the agent-server's own ``os.environ`` so a
+        per-conversation/provider secret wins over a same-named server env var.
+        """
         from pydantic import SecretStr
 
+        from openhands.sdk.conversation.impl.local_conversation import (
+            LocalConversation,
+        )
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
@@ -6334,24 +6571,30 @@ class TestACPSecretRegistryEnvInjection:
                 secrets={"GITHUB_TOKEN": StaticSecret(value=SecretStr("from-context"))}
             )
         )
-        env = self._run_start_capturing_env(
-            agent,
-            tmp_path,
-            extra_os_env={"GITHUB_TOKEN": "ambient-should-lose"},
-        )
+        conv = LocalConversation(agent, workspace=str(tmp_path))
+        try:
+            env = self._run_start_capturing_env(
+                agent,
+                tmp_path,
+                extra_os_env={"GITHUB_TOKEN": "ambient-should-lose"},
+                state=conv.state,
+            )
+        finally:
+            conv.close()
         assert env.get("GITHUB_TOKEN") == "from-context"
 
 
 class TestACPEnvConflictSuppression:
-    """CLAUDE_CONFIG_DIR OAuth auth must not coexist with API-key env vars.
+    """An active CLAUDE_CODE_OAUTH_TOKEN must not coexist with API-key env vars.
 
-    When CLAUDE_CONFIG_DIR is present in the subprocess environment the agent
-    uses a credential file for OAuth.  If ANTHROPIC_API_KEY or
-    ANTHROPIC_BASE_URL are also present they redirect requests to a proxy that
-    does not support OAuth bearer tokens, breaking auth silently.
+    When CLAUDE_CODE_OAUTH_TOKEN is present the subprocess authenticates with
+    that bearer against api.anthropic.com.  A co-present ANTHROPIC_API_KEY would
+    take precedence (bypassing the subscription) and an ANTHROPIC_BASE_URL would
+    route the bearer to a proxy that rejects it, breaking auth silently.
 
     _start_acp_server must strip the conflicting vars regardless of where they
     came from: acp_env, os.environ, secret_registry, or agent_context.secrets.
+    The strip is keyed on the token, not on CLAUDE_CONFIG_DIR (#3588).
     """
 
     @staticmethod
@@ -6435,25 +6678,25 @@ class TestACPEnvConflictSuppression:
 
         return captured
 
-    def test_claude_config_dir_suppresses_api_key_from_acp_env(self, tmp_path):
-        """ANTHROPIC_API_KEY from acp_env is stripped when CLAUDE_CONFIG_DIR present."""
+    def test_oauth_token_suppresses_api_key_from_acp_env(self, tmp_path):
+        """ANTHROPIC_API_KEY from acp_env is stripped when the OAuth token is set."""
         agent = _make_agent(
             acp_env={
-                "CLAUDE_CONFIG_DIR": "/tmp/claude-creds",
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok",
                 "ANTHROPIC_API_KEY": "sk-conflict",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
             }
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
-        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-creds"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_os_environ(self, tmp_path):
+    def test_oauth_token_suppresses_api_key_from_os_environ(self, tmp_path):
         """ANTHROPIC_API_KEY leaking in from os.environ is stripped too."""
         agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+            acp_env={"CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok"},
         )
         env = self._run_start_capturing_env(
             agent,
@@ -6464,46 +6707,45 @@ class TestACPEnvConflictSuppression:
             },
         )
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_registry(self, tmp_path):
-        """ANTHROPIC_API_KEY injected via secret_registry is stripped too.
+    def test_oauth_token_suppresses_api_key_from_registry(self, tmp_path):
+        """The token + conflicting vars all injected via secret_registry.
 
         This is the channel provider creds now travel on (folded into
         ``agent_context.secrets`` by ``create_agent`` → lifted into the
         registry by ``create_request``).
         """
-        agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
-        )
+        agent = _make_agent()
         env = self._run_start_capturing_env(
             agent,
             tmp_path,
             registry_secrets={
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-from-registry",
                 "ANTHROPIC_API_KEY": "sk-from-registry",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
             },
         )
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-from-registry"
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_secrets(self, tmp_path):
-        """ANTHROPIC_API_KEY drained from agent_context.secrets is stripped too.
+    def test_oauth_token_suppresses_api_key_from_secrets(self, tmp_path):
+        """Conflicting vars drained from agent_context.secrets are stripped too.
 
         Covers the canvas-local channel: provider creds folded into
         ``agent_context.secrets`` reach env via the drain, and must still be
-        stripped when CLAUDE_CONFIG_DIR is active.
+        stripped when the OAuth token is active.
         """
         from pydantic import SecretStr
 
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+            acp_env={"CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok"},
             agent_context=AgentContext(
                 secrets={
                     "ANTHROPIC_API_KEY": StaticSecret(
@@ -6518,19 +6760,35 @@ class TestACPEnvConflictSuppression:
         with pytest.warns(DeprecationWarning, match=r"ACPAgent\.acp_env"):
             env = self._run_start_capturing_env(agent, tmp_path)
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_no_suppression_without_claude_config_dir(self, tmp_path):
-        """Without CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY passes through unchanged."""
+    def test_no_suppression_without_oauth_token(self, tmp_path):
+        """Without the OAuth token, ANTHROPIC_API_KEY passes through unchanged."""
         agent = _make_agent(
             acp_env={"ANTHROPIC_API_KEY": "sk-valid"},
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
         assert env.get("ANTHROPIC_API_KEY") == "sk-valid"
-        assert "CLAUDE_CONFIG_DIR" not in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    def test_config_dir_alone_does_not_suppress_api_key(self, tmp_path):
+        """Regression (#3588): CLAUDE_CONFIG_DIR without the OAuth token must NOT
+        strip ANTHROPIC_API_KEY. The config dir is a location lever (data-dir
+        isolation), orthogonal to auth mode — keying the strip on it used to
+        delete a working API key during isolation."""
+        agent = _make_agent(
+            acp_env={
+                "CLAUDE_CONFIG_DIR": "/tmp/claude-isolated",
+                "ANTHROPIC_API_KEY": "sk-valid",
+            }
+        )
+        env = self._run_start_capturing_env(agent, tmp_path)
+
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-isolated"
+        assert env.get("ANTHROPIC_API_KEY") == "sk-valid"
 
 
 class TestACPAgentCurrentModelIdProperty:
@@ -7106,9 +7364,12 @@ class TestACPFileSecretMaterialisation:
         # preserved 0644 file staying world-readable).
         assert refreshed.stat().st_mode & 0o777 == 0o600
 
-    def test_reads_from_agent_context_secrets_drain(self, tmp_path):
-        """The reserved secret can arrive via agent_context.secrets (canvas-local
-        path) rather than the registry."""
+    def test_reads_reserved_secret_seeded_from_agent_context(self, tmp_path):
+        """A reserved file secret supplied via agent_context.secrets (canvas-local
+        path) is seeded into the registry at conversation init and materialised."""
+        from openhands.sdk.conversation.impl.local_conversation import (
+            LocalConversation,
+        )
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
@@ -7117,8 +7378,15 @@ class TestACPFileSecretMaterialisation:
                 secrets={"CODEX_AUTH_JSON": StaticSecret(value=SecretStr('{"a": 1}'))},
             ),
         )
-        state = self._state(tmp_path)
-        env = self._run_start(agent, state, conn=self._make_conn())
+        conv = LocalConversation(
+            agent,
+            workspace=str(tmp_path / "ws"),
+            persistence_dir=str(tmp_path / "conversations"),
+        )
+        try:
+            env = self._run_start(agent, conv.state, conn=self._make_conn())
+        finally:
+            conv.close()
 
         auth_file = Path(env["CODEX_HOME"]) / "auth.json"
         assert auth_file.read_text(encoding="utf-8") == '{"a": 1}'
@@ -7398,13 +7666,15 @@ class TestACPDataDirIsolation:
             encoding="utf-8"
         ) == '{"tokens": "x"}'
 
-    # --- Claude carve-out: must not knock out an active API key --------------
+    # --- Claude: isolation applies under either auth mode (#3588) ------------
 
-    def test_claude_skips_when_api_key_active(self, tmp_path):
+    def test_claude_isolates_under_api_key(self, tmp_path):
         from openhands.sdk.secret import StaticSecret
 
         agent = self._agent(["npx", "-y", "@agentclientprotocol/claude-agent-acp"])
         state = self._H._state(tmp_path)
+        persist = state.persistence_dir
+        assert persist is not None
         state.secret_registry.update_secrets(
             {"ANTHROPIC_API_KEY": StaticSecret(value=SecretStr("sk-live"))}
         )
@@ -7412,9 +7682,10 @@ class TestACPDataDirIsolation:
             env = self._H._run_start(
                 agent, state, conn=self._H._make_conn(agent_name="claude-agent-acp")
             )
-        # Setting CLAUDE_CONFIG_DIR would trip _ENV_CONFLICT_MAP and strip the
-        # key, so isolation is skipped and the working key survives.
-        assert "CLAUDE_CONFIG_DIR" not in env
+        # #3588: the conflict strip is keyed on CLAUDE_CODE_OAUTH_TOKEN, not on
+        # CLAUDE_CONFIG_DIR, so relocating the data dir no longer strips a working
+        # API key — API-key Claude gets the same per-conversation isolation.
+        assert Path(env["CLAUDE_CONFIG_DIR"]) == Path(persist) / "acp" / "claude-code"
         assert env["ANTHROPIC_API_KEY"] == "sk-live"
 
     def test_claude_isolates_under_oauth_token(self, tmp_path):
