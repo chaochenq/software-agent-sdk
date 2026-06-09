@@ -6,6 +6,19 @@ from openhands.sdk.llm.options.common import apply_defaults_if_absent
 from openhands.sdk.llm.utils.model_features import get_features
 
 
+def _model_supports_vertex_cached_content(model: str) -> bool:
+    """Return True iff sending ``cached_content`` to this model is safe.
+
+    LiteLLM forwards ``cached_content`` as a top-level kwarg through to the
+    Vertex Gemini ``generateContent`` API. Other providers (OpenAI, Anthropic,
+    etc.) will reject unknown kwargs, so we gate emission to model names that
+    look Gemini-flavoured regardless of which LiteLLM provider prefix routes
+    them: ``vertex_ai/``, ``gemini/``, ``litellm_proxy/gemini-*`` (assuming
+    the proxy forwards to a Vertex backend), and bare ``gemini-*``.
+    """
+    return "gemini" in (model or "").lower()
+
+
 def select_chat_options(
     llm, user_kwargs: dict[str, Any], has_tools: bool
 ) -> dict[str, Any]:
@@ -98,5 +111,18 @@ def select_chat_options(
 
     if llm._prompt_cache_key:
         out["prompt_cache_key"] = llm._prompt_cache_key
+
+    # Vertex AI explicit context cache: user pre-creates a CachedContent
+    # resource (see https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache)
+    # and references it by name. LiteLLM forwards the kwarg to the Vertex
+    # ``generateContent`` API as ``cachedContent``. We only emit when the model
+    # is Gemini-flavoured so unknown-kwarg-rejecting providers (OpenAI, etc.)
+    # are left untouched. User-supplied kwargs take precedence.
+    if (
+        llm.vertex_cached_content
+        and "cached_content" not in out
+        and _model_supports_vertex_cached_content(llm.model)
+    ):
+        out["cached_content"] = llm.vertex_cached_content
 
     return out

@@ -21,6 +21,7 @@ class DummyLLM:
     _prompt_cache_key: str | None = None
     openrouter_site_url: str = ""
     openrouter_app_name: str = ""
+    vertex_cached_content: str | None = None
 
     def _openrouter_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -243,3 +244,91 @@ def test_chat_options_omits_openrouter_headers_when_unset():
     llm = DummyLLM(model="gpt-4o")
     out = select_chat_options(llm, user_kwargs={}, has_tools=False)
     assert "extra_headers" not in out
+
+
+# ---------------------------------------------------------------------------
+# vertex_cached_content
+# ---------------------------------------------------------------------------
+
+
+def test_vertex_cached_content_emitted_for_vertex_gemini():
+    """``vertex_cached_content`` is forwarded as ``cached_content`` for Gemini."""
+    llm = LLM(
+        model="vertex_ai/gemini-3-flash",
+        vertex_cached_content="cachedContents/1234567890",
+    )
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert out["cached_content"] == "cachedContents/1234567890"
+
+
+def test_vertex_cached_content_emitted_for_gemini_provider():
+    """Bare ``gemini/`` provider also gets the kwarg."""
+    llm = LLM(
+        model="gemini/gemini-3-flash",
+        vertex_cached_content="cachedContents/abc",
+    )
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert out["cached_content"] == "cachedContents/abc"
+
+
+def test_vertex_cached_content_emitted_for_litellm_proxy_gemini():
+    """Proxy-routed Gemini models receive the kwarg too.
+
+    Whether the proxy actually forwards it to Vertex is a proxy-side concern,
+    but the SDK must pass it through so a well-configured proxy can act on it.
+    """
+    llm = LLM(
+        model="litellm_proxy/gemini-3.5-flash",
+        vertex_cached_content="cachedContents/xyz",
+    )
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert out["cached_content"] == "cachedContents/xyz"
+
+
+def test_vertex_cached_content_suppressed_for_openai():
+    """Non-Gemini providers (OpenAI, Anthropic, …) must not see the kwarg.
+
+    They reject unknown kwargs, so emitting ``cached_content`` would break the
+    call. The user setting the field on a non-Gemini LLM is a misconfiguration
+    we silently tolerate rather than escalate to an error.
+    """
+    llm = LLM(
+        model="gpt-5-mini",
+        vertex_cached_content="cachedContents/should-be-ignored",
+    )
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert "cached_content" not in out
+
+
+def test_vertex_cached_content_suppressed_for_claude():
+    """Anthropic models likewise."""
+    llm = LLM(
+        model="claude-sonnet-4-5",
+        vertex_cached_content="cachedContents/should-be-ignored",
+    )
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert "cached_content" not in out
+
+
+def test_vertex_cached_content_omitted_when_unset():
+    """Default ``None`` produces no kwarg even on a Gemini model."""
+    llm = LLM(model="vertex_ai/gemini-3-flash")
+    out = select_chat_options(llm, user_kwargs={}, has_tools=True)
+    assert "cached_content" not in out
+
+
+def test_vertex_cached_content_respects_user_kwarg_override():
+    """A caller-supplied ``cached_content`` wins over the LLM config field.
+
+    This matches the precedence we apply elsewhere (extra_headers, etc.).
+    """
+    llm = LLM(
+        model="vertex_ai/gemini-3-flash",
+        vertex_cached_content="cachedContents/from-config",
+    )
+    out = select_chat_options(
+        llm,
+        user_kwargs={"cached_content": "cachedContents/from-caller"},
+        has_tools=True,
+    )
+    assert out["cached_content"] == "cachedContents/from-caller"

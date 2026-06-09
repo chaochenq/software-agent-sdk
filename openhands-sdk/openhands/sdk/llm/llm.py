@@ -472,6 +472,25 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         ),
     )
 
+    vertex_cached_content: str | None = Field(
+        default=None,
+        description=(
+            "Reference an existing Vertex AI ``CachedContent`` resource to use as "
+            "the cache prefix for every request. Pass the full resource name, e.g. "
+            '``"cachedContents/1234567890"`` returned by '
+            "``CachedContent.create``. The SDK threads it through to LiteLLM, "
+            "which forwards it to the Vertex Gemini ``generateContent`` API as "
+            "``cachedContent``. This bypasses the inline ``cache_control`` marker "
+            "path (which only works for ``vertex_ai/`` direct, not via "
+            "``litellm_proxy/``) and gives deterministic, explicit caching for "
+            "long-running agent runs whose system + tool prefix exceeds Vertex's "
+            "minimum cache size. The caller is responsible for creating, "
+            "refreshing the TTL, and deleting the cache resource — see "
+            "https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache. "
+            "Ignored for non-Vertex / non-Gemini providers."
+        ),
+    )
+
     fallback_strategy: FallbackStrategy | None = Field(
         default=None,
         description=(
