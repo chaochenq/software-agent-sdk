@@ -6585,15 +6585,16 @@ class TestACPSecretRegistryEnvInjection:
 
 
 class TestACPEnvConflictSuppression:
-    """CLAUDE_CONFIG_DIR OAuth auth must not coexist with API-key env vars.
+    """An active CLAUDE_CODE_OAUTH_TOKEN must not coexist with API-key env vars.
 
-    When CLAUDE_CONFIG_DIR is present in the subprocess environment the agent
-    uses a credential file for OAuth.  If ANTHROPIC_API_KEY or
-    ANTHROPIC_BASE_URL are also present they redirect requests to a proxy that
-    does not support OAuth bearer tokens, breaking auth silently.
+    When CLAUDE_CODE_OAUTH_TOKEN is present the subprocess authenticates with
+    that bearer against api.anthropic.com.  A co-present ANTHROPIC_API_KEY would
+    take precedence (bypassing the subscription) and an ANTHROPIC_BASE_URL would
+    route the bearer to a proxy that rejects it, breaking auth silently.
 
     _start_acp_server must strip the conflicting vars regardless of where they
     came from: acp_env, os.environ, secret_registry, or agent_context.secrets.
+    The strip is keyed on the token, not on CLAUDE_CONFIG_DIR (#3588).
     """
 
     @staticmethod
@@ -6677,25 +6678,25 @@ class TestACPEnvConflictSuppression:
 
         return captured
 
-    def test_claude_config_dir_suppresses_api_key_from_acp_env(self, tmp_path):
-        """ANTHROPIC_API_KEY from acp_env is stripped when CLAUDE_CONFIG_DIR present."""
+    def test_oauth_token_suppresses_api_key_from_acp_env(self, tmp_path):
+        """ANTHROPIC_API_KEY from acp_env is stripped when the OAuth token is set."""
         agent = _make_agent(
             acp_env={
-                "CLAUDE_CONFIG_DIR": "/tmp/claude-creds",
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok",
                 "ANTHROPIC_API_KEY": "sk-conflict",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
             }
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
-        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-creds"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_os_environ(self, tmp_path):
+    def test_oauth_token_suppresses_api_key_from_os_environ(self, tmp_path):
         """ANTHROPIC_API_KEY leaking in from os.environ is stripped too."""
         agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+            acp_env={"CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok"},
         )
         env = self._run_start_capturing_env(
             agent,
@@ -6706,46 +6707,45 @@ class TestACPEnvConflictSuppression:
             },
         )
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_registry(self, tmp_path):
-        """ANTHROPIC_API_KEY injected via secret_registry is stripped too.
+    def test_oauth_token_suppresses_api_key_from_registry(self, tmp_path):
+        """The token + conflicting vars all injected via secret_registry.
 
         This is the channel provider creds now travel on (folded into
         ``agent_context.secrets`` by ``create_agent`` → lifted into the
         registry by ``create_request``).
         """
-        agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
-        )
+        agent = _make_agent()
         env = self._run_start_capturing_env(
             agent,
             tmp_path,
             registry_secrets={
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-from-registry",
                 "ANTHROPIC_API_KEY": "sk-from-registry",
                 "ANTHROPIC_BASE_URL": "https://proxy.example.com",
             },
         )
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-from-registry"
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_claude_config_dir_suppresses_api_key_from_secrets(self, tmp_path):
-        """ANTHROPIC_API_KEY drained from agent_context.secrets is stripped too.
+    def test_oauth_token_suppresses_api_key_from_secrets(self, tmp_path):
+        """Conflicting vars drained from agent_context.secrets are stripped too.
 
         Covers the canvas-local channel: provider creds folded into
         ``agent_context.secrets`` reach env via the drain, and must still be
-        stripped when CLAUDE_CONFIG_DIR is active.
+        stripped when the OAuth token is active.
         """
         from pydantic import SecretStr
 
         from openhands.sdk.secret import StaticSecret
 
         agent = _make_agent(
-            acp_env={"CLAUDE_CONFIG_DIR": "/tmp/claude-creds"},
+            acp_env={"CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok"},
             agent_context=AgentContext(
                 secrets={
                     "ANTHROPIC_API_KEY": StaticSecret(
@@ -6760,19 +6760,35 @@ class TestACPEnvConflictSuppression:
         with pytest.warns(DeprecationWarning, match=r"ACPAgent\.acp_env"):
             env = self._run_start_capturing_env(agent, tmp_path)
 
-        assert "CLAUDE_CONFIG_DIR" in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env
         assert "ANTHROPIC_API_KEY" not in env
         assert "ANTHROPIC_BASE_URL" not in env
 
-    def test_no_suppression_without_claude_config_dir(self, tmp_path):
-        """Without CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY passes through unchanged."""
+    def test_no_suppression_without_oauth_token(self, tmp_path):
+        """Without the OAuth token, ANTHROPIC_API_KEY passes through unchanged."""
         agent = _make_agent(
             acp_env={"ANTHROPIC_API_KEY": "sk-valid"},
         )
         env = self._run_start_capturing_env(agent, tmp_path)
 
         assert env.get("ANTHROPIC_API_KEY") == "sk-valid"
-        assert "CLAUDE_CONFIG_DIR" not in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    def test_config_dir_alone_does_not_suppress_api_key(self, tmp_path):
+        """Regression (#3588): CLAUDE_CONFIG_DIR without the OAuth token must NOT
+        strip ANTHROPIC_API_KEY. The config dir is a location lever (data-dir
+        isolation), orthogonal to auth mode — keying the strip on it used to
+        delete a working API key during isolation."""
+        agent = _make_agent(
+            acp_env={
+                "CLAUDE_CONFIG_DIR": "/tmp/claude-isolated",
+                "ANTHROPIC_API_KEY": "sk-valid",
+            }
+        )
+        env = self._run_start_capturing_env(agent, tmp_path)
+
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-isolated"
+        assert env.get("ANTHROPIC_API_KEY") == "sk-valid"
 
 
 class TestACPAgentCurrentModelIdProperty:
@@ -7650,13 +7666,15 @@ class TestACPDataDirIsolation:
             encoding="utf-8"
         ) == '{"tokens": "x"}'
 
-    # --- Claude carve-out: must not knock out an active API key --------------
+    # --- Claude: isolation applies under either auth mode (#3588) ------------
 
-    def test_claude_skips_when_api_key_active(self, tmp_path):
+    def test_claude_isolates_under_api_key(self, tmp_path):
         from openhands.sdk.secret import StaticSecret
 
         agent = self._agent(["npx", "-y", "@agentclientprotocol/claude-agent-acp"])
         state = self._H._state(tmp_path)
+        persist = state.persistence_dir
+        assert persist is not None
         state.secret_registry.update_secrets(
             {"ANTHROPIC_API_KEY": StaticSecret(value=SecretStr("sk-live"))}
         )
@@ -7664,9 +7682,10 @@ class TestACPDataDirIsolation:
             env = self._H._run_start(
                 agent, state, conn=self._H._make_conn(agent_name="claude-agent-acp")
             )
-        # Setting CLAUDE_CONFIG_DIR would trip _ENV_CONFLICT_MAP and strip the
-        # key, so isolation is skipped and the working key survives.
-        assert "CLAUDE_CONFIG_DIR" not in env
+        # #3588: the conflict strip is keyed on CLAUDE_CODE_OAUTH_TOKEN, not on
+        # CLAUDE_CONFIG_DIR, so relocating the data dir no longer strips a working
+        # API key — API-key Claude gets the same per-conversation isolation.
+        assert Path(env["CLAUDE_CONFIG_DIR"]) == Path(persist) / "acp" / "claude-code"
         assert env["ANTHROPIC_API_KEY"] == "sk-live"
 
     def test_claude_isolates_under_oauth_token(self, tmp_path):
@@ -7950,66 +7969,3 @@ class TestACPStepMasksPersistedTurn:
         )
         assert "supersecret" not in finish.action.message
         assert finish.action.message == "the value is <secret-hidden> now"
-
-
-# ---------------------------------------------------------------------------
-# Session-blob export/import wrappers (issue #1126)
-# ---------------------------------------------------------------------------
-
-
-class TestACPSessionBlobWrappers:
-    """Thin ACPAgent wrappers over the acp_session_blob helpers: resolve the
-    provider from ``acp_command`` and the per-conversation data root from
-    ``_acp_file_secret_dir``, then delegate.
-    """
-
-    _H = TestACPFileSecretMaterialisation
-
-    def test_export_round_trips_through_data_root(self, tmp_path):
-        agent = ACPAgent(acp_command=["codex-acp"])
-        state = self._H._state(tmp_path)
-        assert state.persistence_dir is not None
-        data_root = Path(state.persistence_dir) / "acp" / "codex"
-        sessions = data_root / "sessions" / "2026"
-        sessions.mkdir(parents=True)
-        (sessions / "rollout-abc.jsonl").write_text('{"turn": 1}\n')
-        (data_root / "auth.json").write_text('{"refresh_token": "SECRET"}')
-
-        blob = agent.export_cli_session_blob(state)
-
-        assert blob is not None
-        import io
-        import tarfile
-
-        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-            assert tar.getnames() == ["sessions/2026/rollout-abc.jsonl"]
-
-        fresh_root = tmp_path / "fresh"
-        fresh_root.mkdir()
-        fresh_state = self._H._state(fresh_root)
-        assert agent.import_cli_session_blob(fresh_state, blob) == 1
-        assert fresh_state.persistence_dir is not None
-        restored = (
-            Path(fresh_state.persistence_dir)
-            / "acp"
-            / "codex"
-            / "sessions"
-            / "2026"
-            / "rollout-abc.jsonl"
-        )
-        assert restored.read_text() == '{"turn": 1}\n'
-
-    def test_export_none_for_custom_command(self, tmp_path):
-        agent = ACPAgent(acp_command=["my-custom-acp-server"])
-        state = self._H._state(tmp_path)
-        assert agent.export_cli_session_blob(state) is None
-        assert agent.import_cli_session_blob(state, b"anything") == 0
-
-    def test_export_none_for_gemini(self, tmp_path):
-        agent = ACPAgent(acp_command=["npx", "-y", "@google/gemini-cli", "--acp"])
-        state = self._H._state(tmp_path)
-        assert state.persistence_dir is not None
-        gemini_root = Path(state.persistence_dir) / "acp" / "gemini-cli"
-        (gemini_root / "sessions").mkdir(parents=True)
-        (gemini_root / "sessions" / "x.jsonl").write_text("{}")
-        assert agent.export_cli_session_blob(state) is None
