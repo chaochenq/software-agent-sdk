@@ -147,6 +147,13 @@ MODELS = {
         "display_name": "Claude Fable 5",
         "llm_config": {
             "model": "litellm_proxy/anthropic/claude-fable-5",
+            # litellm.model_cost has no entry for claude-fable-5 yet, so
+            # alias capability lookups (vision, prompt cache, context
+            # window, responses API) to a known vision-capable sibling.
+            # Without this, LLM.vision_is_active() returns False and
+            # t08_image_file_viewing skips even though the model itself
+            # supports images.
+            "model_canonical_name": "anthropic/claude-opus-4-8",
         },
     },
     "claude-sonnet-4-6": {
