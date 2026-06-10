@@ -25,7 +25,6 @@ from openhands.agent_server.config import (
     get_default_config,
 )
 from openhands.agent_server.conversation_router import conversation_router
-from openhands.agent_server.conversation_router_acp import conversation_router_acp
 from openhands.agent_server.conversation_service import (
     get_default_conversation_service,
 )
@@ -42,6 +41,10 @@ from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.llm_router import llm_router
 from openhands.agent_server.mcp_router import mcp_router
 from openhands.agent_server.middleware import CORSDispatcher
+from openhands.agent_server.openai.router import (
+    create_openai_api_key_dependency,
+    openai_router,
+)
 from openhands.agent_server.profiles_router import profiles_router
 from openhands.agent_server.server_details_router import (
     get_server_info,
@@ -301,7 +304,6 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
     api_router.include_router(event_router)
     api_router.include_router(conversation_router)
-    api_router.include_router(conversation_router_acp)
     api_router.include_router(tool_router)
     api_router.include_router(bash_router)
     api_router.include_router(git_router)
@@ -320,6 +322,11 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     # so it lives under the header-only auth group.
     api_router.include_router(auth_router)
     app.include_router(api_router)
+
+    openai_dependencies = []
+    if config.session_api_keys:
+        openai_dependencies.append(Depends(create_openai_api_key_dependency(config)))
+    app.include_router(openai_router, dependencies=openai_dependencies)
 
     # Workspace static-file routes get their own auth group that accepts
     # EITHER the X-Session-API-Key header OR the workspace session cookie.
