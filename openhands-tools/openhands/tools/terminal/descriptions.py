@@ -1,9 +1,41 @@
 """User-facing terminal tool descriptions by shell family."""
 
+# Shared paragraph that proactively warns the model against the
+# Python-/JSON-literal-as-command pattern. This block addresses a real-world
+# failure mode observed in long-context, non-cached models (e.g. Nemotron 550B)
+# where the agent would otherwise burn dozens of turns per task repeating the
+# same malformed call shape. Keep this short — every byte is paid for on every
+# turn on non-caching providers.
+_LITERAL_ARG_GUIDANCE = "\n".join(
+    [
+        "### ⚠️ Command Argument Format (read this first)",
+        "* The `command` argument must be a **shell command**, not a Python or",
+        "  JSON literal. Do NOT put a `dict`, `list`, multi-line code block,",
+        "  or other structured data directly into `command`.",
+        "* If you need to execute code that has structured data or multiple",
+        "  lines, use ONE of:",
+        "  1. **Write a script first**, then run it: use `file_editor` with",
+        '     `command="create"` to write `/tmp/run.py`, then call this tool',
+        '     with `command="python /tmp/run.py"`.',
+        "  2. **Inline heredoc**, e.g.:",
+        "         python - <<'EOF'",
+        "         DATABASES = {'default': {...}}",
+        "         # your code",
+        "         EOF",
+        "* Examples that will be REJECTED:",
+        "  - `command=\"[{'default': {...}}, ['apps'], ['code...']]\"`",
+        '  - `command=\'["some", "list"]\'`',
+        '  - `command=\'{"key": "value"}\'`',
+    ]
+)
+
+
 UNIX_TOOL_DESCRIPTION = "\n".join(
     [
         "Execute a shell command in the terminal within a persistent shell session.",
         "",
+        "",
+        _LITERAL_ARG_GUIDANCE,
         "",
         "### Command Execution",
         "* One command at a time: You can only execute one shell command at a time.",
@@ -50,6 +82,8 @@ WINDOWS_TOOL_DESCRIPTION = "\n".join(
             "PowerShell session."
         ),
         "",
+        "",
+        _LITERAL_ARG_GUIDANCE,
         "",
         "### Command Execution",
         "* One command at a time: You can only execute one PowerShell command at a",
