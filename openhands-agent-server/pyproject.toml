@@ -38,10 +38,11 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
-# Include Docker-related files and VSCode extensions
+# Include runtime data files bundled with the agent-server package
 "openhands.agent_server" = [
   "docker/Dockerfile",
   "docker/wallpaper.svg",
+  "frontend/**/*",
   "vscode_extensions/**/*.json",
   "vscode_extensions/**/*.js",
 ]

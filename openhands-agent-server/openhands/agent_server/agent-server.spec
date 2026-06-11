@@ -92,6 +92,9 @@ a = Analysis(
         # task_tool_set description.
         *collect_data_files("openhands.tools.preset", includes=["subagents/*.md"]),
 
+        # Optional bundled agent-canvas frontend assets.
+        *collect_data_files("openhands.agent_server", includes=["frontend/**/*"]),
+
         # Package metadata for importlib.metadata
         *copy_metadata("openhands-agent-server"),
         *copy_metadata("openhands-sdk"),

@@ -6,6 +6,7 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from openhands.agent_server.env_parser import from_env
+from openhands.agent_server.frontend import get_bundled_frontend_path
 from openhands.sdk.utils.cipher import Cipher
 
 
@@ -164,6 +165,14 @@ class Config(BaseModel):
             "The location of the directory containing static files to serve. "
             "If specified and the directory exists, static files will be served "
             "at the /static/ endpoint."
+        ),
+    )
+    frontend_files_path: Path | None = Field(
+        default_factory=get_bundled_frontend_path,
+        description=(
+            "The location of the agent-canvas frontend build to serve at /. "
+            "Defaults to bundled frontend assets when they are packaged with "
+            "openhands-agent-server."
         ),
     )
     webhooks: list[WebhookSpec] = Field(

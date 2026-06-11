@@ -260,6 +260,62 @@ class TestRootRedirect:
         assert response.status_code == 200
 
 
+def test_frontend_files_served_from_root(tmp_path):
+    index = tmp_path / "index.html"
+    index.write_text('<script type="module" src="/assets/app.js"></script>')
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "app.js").write_text("console.log('agent-canvas')")
+    (tmp_path / "favicon.svg").write_text("<svg></svg>")
+
+    app = create_app(Config(static_files_path=None, frontend_files_path=tmp_path))
+    client = TestClient(app)
+
+    root_response = client.get("/")
+    assert root_response.status_code == 200
+    assert root_response.text == index.read_text()
+    assert "text/html" in root_response.headers["content-type"]
+
+    asset_response = client.get("/assets/app.js")
+    assert asset_response.status_code == 200
+    assert asset_response.text == "console.log('agent-canvas')"
+    assert "javascript" in asset_response.headers["content-type"]
+
+    favicon_response = client.get("/favicon.svg")
+    assert favicon_response.status_code == 200
+    assert favicon_response.text == "<svg></svg>"
+
+
+def test_frontend_files_fallback_to_index_for_spa_routes(tmp_path):
+    index_content = "<html><body>agent canvas</body></html>"
+    (tmp_path / "index.html").write_text(index_content)
+
+    app = create_app(Config(static_files_path=None, frontend_files_path=tmp_path))
+    client = TestClient(app)
+
+    response = client.get("/settings/llm")
+    assert response.status_code == 200
+    assert response.text == index_content
+
+
+def test_frontend_files_do_not_fallback_for_missing_assets_or_api_paths(tmp_path):
+    (tmp_path / "index.html").write_text("<html><body>agent canvas</body></html>")
+
+    app = create_app(Config(static_files_path=None, frontend_files_path=tmp_path))
+    client = TestClient(app)
+
+    missing_asset_response = client.get("/assets/missing.js")
+    assert missing_asset_response.status_code == 404
+
+    missing_api_response = client.get("/api/not-a-real-route")
+    assert missing_api_response.status_code == 404
+    assert missing_api_response.headers["content-type"].startswith("application/json")
+
+    server_info_response = client.get("/server_info")
+    assert server_info_response.status_code == 200
+    assert server_info_response.headers["content-type"].startswith("application/json")
+
+
 class TestServiceParallelization:
     """Test that services are started and stopped in parallel."""
 

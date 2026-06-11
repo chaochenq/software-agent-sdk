@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import libtmux
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
@@ -36,6 +36,7 @@ from openhands.agent_server.desktop_router import desktop_router
 from openhands.agent_server.desktop_service import get_desktop_service
 from openhands.agent_server.event_router import event_router
 from openhands.agent_server.file_router import file_router
+from openhands.agent_server.frontend import is_frontend_path
 from openhands.agent_server.git_router import git_router
 from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.llm_router import llm_router
@@ -345,6 +346,44 @@ def _add_api_routes(app: FastAPI, config: Config) -> None:
     app.include_router(sockets_router)
 
 
+_FRONTEND_REJECT_PREFIXES = (
+    "/api",
+    "/sockets",
+    "/server_info",
+    "/health",
+    "/ready",
+    "/alive",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/static",
+)
+
+
+def _matches_frontend_reject_prefix(path: str) -> bool:
+    request_path = f"/{path.lstrip('/')}"
+    return any(
+        request_path == prefix or request_path.startswith(f"{prefix}/")
+        for prefix in _FRONTEND_REJECT_PREFIXES
+    )
+
+
+def _resolve_frontend_file(frontend_dir: Path, path: str) -> Path | None:
+    frontend_root = frontend_dir.resolve()
+    file_path = (frontend_root / path).resolve()
+    try:
+        file_path.relative_to(frontend_root)
+    except ValueError:
+        return None
+    if file_path.is_file():
+        return file_path
+    return None
+
+
+def _is_asset_request(path: str) -> bool:
+    return bool(Path(path).suffix)
+
+
 def _setup_static_files(app: FastAPI, config: Config) -> None:
     """Set up static file serving and root redirect if configured.
 
@@ -352,14 +391,16 @@ def _setup_static_files(app: FastAPI, config: Config) -> None:
         app: FastAPI application instance.
         config: Configuration object containing static files settings.
     """
+    has_frontend = is_frontend_path(config.frontend_files_path)
+
     # Only proceed if static files are configured and directory exists
     if not (
         config.static_files_path
         and config.static_files_path.exists()
         and config.static_files_path.is_dir()
     ):
-        # Map the root path to server info if there are no static files
-        app.get("/", tags=["Server Details"])(get_server_info)
+        if not has_frontend:
+            app.get("/", tags=["Server Details"])(get_server_info)
         return
 
     # Mount static files directory
@@ -368,6 +409,9 @@ def _setup_static_files(app: FastAPI, config: Config) -> None:
         StaticFiles(directory=str(config.static_files_path)),
         name="static",
     )
+
+    if has_frontend:
+        return
 
     # Add root redirect to static files
     @app.get("/", tags=["Server Details"])
@@ -381,6 +425,30 @@ def _setup_static_files(app: FastAPI, config: Config) -> None:
             return RedirectResponse(url="/static/index.html", status_code=302)
         else:
             return RedirectResponse(url="/static/", status_code=302)
+
+
+def _setup_frontend_files(app: FastAPI, config: Config) -> None:
+    """Serve the bundled agent-canvas SPA when frontend assets are available."""
+    if not is_frontend_path(config.frontend_files_path):
+        return
+
+    frontend_dir = config.frontend_files_path
+    assert frontend_dir is not None
+    index_path = frontend_dir / "index.html"
+
+    async def serve_frontend(path: str = ""):
+        if _matches_frontend_reject_prefix(path):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        file_path = _resolve_frontend_file(frontend_dir, path)
+        if file_path is not None:
+            return FileResponse(file_path)
+        if _is_asset_request(path):
+            raise HTTPException(status_code=404, detail="Not Found")
+        return FileResponse(index_path)
+
+    app.get("/", include_in_schema=False)(serve_frontend)
+    app.get("/{path:path}", include_in_schema=False)(serve_frontend)
 
 
 def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict]:
@@ -555,6 +623,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     _add_api_routes(app, config)
     _setup_static_files(app, config)
+    _setup_frontend_files(app, config)
     app.add_middleware(CORSDispatcher, allow_origins=config.allow_cors_origins)
     _add_exception_handlers(app)
 

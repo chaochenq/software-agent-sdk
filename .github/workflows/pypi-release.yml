@@ -66,6 +66,9 @@ jobs:
                     openhands-agent-server
                   )
 
+                  echo "🚀 Fetching agent-canvas frontend..."
+                  python .github/scripts/fetch_agent_canvas_frontend.py
+
                   echo "🚀 Building and publishing all packages..."
                   for PKG in "${PACKAGES[@]}"; do
                     echo "===== $PKG ====="
