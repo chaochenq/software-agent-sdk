@@ -14,9 +14,9 @@ UNDERLINE := \033[4m
 REQUIRED_UV_VERSION := 0.8.13
 PKGS ?= openhands-sdk openhands-tools openhands-workspace openhands-agent-server
 AGENT_CANVAS_PACKAGE ?= @openhands/agent-canvas
-AGENT_SERVER_FRONTEND_DIR := openhands-agent-server/openhands/agent_server/_frontend
+AGENT_CANVAS_DIR := frontend/agent-canvas
 
-.PHONY: build build-with-frontend agent-canvas-frontend format lint clean help check-uv-version
+.PHONY: build agent-canvas-frontend ensure-agent-canvas canvas format lint clean help check-uv-version
 
 # Default target
 .DEFAULT_GOAL := help
@@ -41,13 +41,11 @@ build: check-uv-version
 	@$(ECHO) "$(YELLOW)Setting up pre-commit hooks...$(RESET)"
 	@uv run pre-commit install
 	@$(ECHO) "$(GREEN)Pre-commit hooks installed successfully.$(RESET)"
+	@$(MAKE) agent-canvas-frontend
 	@$(ECHO) "$(GREEN)Build complete! Development environment is ready.$(RESET)"
 
-build-with-frontend: build agent-canvas-frontend
-	@$(ECHO) "$(GREEN)Build complete with bundled agent-canvas frontend.$(RESET)"
-
 agent-canvas-frontend:
-	@$(ECHO) "$(CYAN)Fetching prebuilt agent-canvas frontend...$(RESET)"
+	@$(ECHO) "$(CYAN)Fetching prebuilt agent-canvas package...$(RESET)"
 	@tmp_dir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	npm --silent pack "$(AGENT_CANVAS_PACKAGE)" --pack-destination "$$tmp_dir" >/dev/null; \
@@ -57,14 +55,22 @@ agent-canvas-frontend:
 		exit 1; \
 	fi; \
 	tar -xzf "$$tarball" -C "$$tmp_dir"; \
-	if [ ! -d "$$tmp_dir/package/build" ]; then \
-		$(ECHO) "$(RED)agent-canvas package does not contain build/ assets.$(RESET)"; \
+	if [ ! -d "$$tmp_dir/package/build" ] || [ ! -f "$$tmp_dir/package/bin/agent-canvas.mjs" ]; then \
+		$(ECHO) "$(RED)agent-canvas package is missing expected build or CLI files.$(RESET)"; \
 		exit 1; \
 	fi; \
-	rm -rf "$(AGENT_SERVER_FRONTEND_DIR)"; \
-	mkdir -p "$(AGENT_SERVER_FRONTEND_DIR)"; \
-	cp -R "$$tmp_dir/package/build/." "$(AGENT_SERVER_FRONTEND_DIR)/"
-	@$(ECHO) "$(GREEN)Bundled frontend assets in $(AGENT_SERVER_FRONTEND_DIR).$(RESET)"
+	rm -rf "$(AGENT_CANVAS_DIR)"; \
+	mkdir -p "$$(dirname "$(AGENT_CANVAS_DIR)")"; \
+	mv "$$tmp_dir/package" "$(AGENT_CANVAS_DIR)"
+	@$(ECHO) "$(GREEN)Installed agent-canvas package in $(AGENT_CANVAS_DIR).$(RESET)"
+
+ensure-agent-canvas:
+	@if [ ! -d "$(AGENT_CANVAS_DIR)/build" ] || [ ! -f "$(AGENT_CANVAS_DIR)/bin/agent-canvas.mjs" ]; then \
+		$(MAKE) agent-canvas-frontend; \
+	fi
+
+canvas: ensure-agent-canvas
+	@OH_AGENT_SERVER_LOCAL_PATH="$(abspath .)" node "$(AGENT_CANVAS_DIR)/bin/agent-canvas.mjs" $(ARGS)
 
 format:
 	@$(ECHO) "$(YELLOW)Formatting code with uv format...$(RESET)"
@@ -96,9 +102,10 @@ help:
 	@$(ECHO) "$(UNDERLINE)Usage:$(RESET) make <COMMAND>"
 	@$(ECHO) ""
 	@$(ECHO) "$(UNDERLINE)Commands:$(RESET)"
-	@$(ECHO) "  $(GREEN)build$(RESET)                Setup development environment (install deps + hooks)"
-	@$(ECHO) "  $(GREEN)build-with-frontend$(RESET)  Setup dev env and bundle agent-canvas frontend"
-	@$(ECHO) "  $(GREEN)agent-canvas-frontend$(RESET) Bundle prebuilt agent-canvas frontend assets"
+	@$(ECHO) "  $(GREEN)build$(RESET)                Setup dev environment and fetch agent-canvas"
+	@$(ECHO) "  $(GREEN)canvas$(RESET)               Start agent-canvas with this SDK checkout"
+	@$(ECHO) "  $(GREEN)agent-canvas-frontend$(RESET) Refresh the downloaded agent-canvas package"
+	@$(ECHO) "  $(YELLOW)                        Pass canvas flags with ARGS, e.g. make canvas ARGS='--frontend-only'$(RESET)"
 	@$(ECHO) "  $(GREEN)build-server$(RESET)         Build agent-server executable"
 	@$(ECHO) "  $(GREEN)test-server-schema$(RESET)   Test server schema"
 	@$(ECHO) "  $(GREEN)format$(RESET)               Format code with uv format"
