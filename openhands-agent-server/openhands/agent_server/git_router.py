@@ -7,7 +7,6 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
-from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.sdk.git.exceptions import GitError, GitRepositoryError
 from openhands.sdk.git.git_changes import get_git_changes
 from openhands.sdk.git.git_diff import get_git_diff
@@ -27,7 +26,6 @@ _REF_QUERY_DESCRIPTION = (
 
 async def _get_git_changes(path: str, ref: str | None) -> list[GitChange]:
     """Internal helper to get git changes for a given path."""
-    update_last_execution_time()
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
@@ -42,7 +40,6 @@ async def _get_git_changes(path: str, ref: str | None) -> list[GitChange]:
 
 async def _get_git_diff(path: str, ref: str | None) -> GitDiff:
     """Internal helper to get git diff for a given path."""
-    update_last_execution_time()
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(

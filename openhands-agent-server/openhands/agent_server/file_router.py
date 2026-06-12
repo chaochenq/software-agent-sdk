@@ -86,7 +86,6 @@ async def _upload_file(path: str, file: UploadFile) -> Success:
 
 async def _download_file(path: str) -> FileResponse:
     """Internal helper to download a file from the workspace."""
-    update_last_execution_time()
     logger.info(f"Downloading file: {path}")
     try:
         target_path = Path(path)
