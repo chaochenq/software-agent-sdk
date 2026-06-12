@@ -18,7 +18,7 @@ AGENT_CANVAS_VERSION ?= 1.0.0-rc.7
 AGENT_CANVAS_PACKAGE ?= $(AGENT_CANVAS_PACKAGE_NAME)@$(AGENT_CANVAS_VERSION)
 AGENT_CANVAS_DIR := agent-canvas
 
-.PHONY: build agent-canvas-frontend ensure-agent-canvas canvas format lint clean help check-uv-version
+.PHONY: build agent-canvas-frontend ensure-agent-canvas run canvas format lint clean help check-uv-version
 
 # Default target
 .DEFAULT_GOAL := help
@@ -71,8 +71,10 @@ ensure-agent-canvas:
 		$(MAKE) agent-canvas-frontend; \
 	fi
 
-canvas: ensure-agent-canvas
+run: ensure-agent-canvas
 	@OH_AGENT_SERVER_LOCAL_PATH="$(abspath .)" node "$(AGENT_CANVAS_DIR)/bin/agent-canvas.mjs" $(ARGS)
+
+canvas: run
 
 format:
 	@$(ECHO) "$(YELLOW)Formatting code with uv format...$(RESET)"
@@ -105,9 +107,10 @@ help:
 	@$(ECHO) ""
 	@$(ECHO) "$(UNDERLINE)Commands:$(RESET)"
 	@$(ECHO) "  $(GREEN)build$(RESET)                Setup dev environment and fetch agent-canvas"
-	@$(ECHO) "  $(GREEN)canvas$(RESET)               Start agent-canvas with this SDK checkout"
+	@$(ECHO) "  $(GREEN)run$(RESET)                  Start the full agent-canvas stack"
+	@$(ECHO) "  $(YELLOW)                        Pass modes with ARGS, e.g. make run ARGS='--frontend-only'$(RESET)"
+	@$(ECHO) "  $(GREEN)canvas$(RESET)               Alias for run"
 	@$(ECHO) "  $(GREEN)agent-canvas-frontend$(RESET) Refresh the downloaded agent-canvas package"
-	@$(ECHO) "  $(YELLOW)                        Pass canvas flags with ARGS, e.g. make canvas ARGS='--frontend-only'$(RESET)"
 	@$(ECHO) "  $(GREEN)build-server$(RESET)         Build agent-server executable"
 	@$(ECHO) "  $(GREEN)test-server-schema$(RESET)   Test server schema"
 	@$(ECHO) "  $(GREEN)format$(RESET)               Format code with uv format"
