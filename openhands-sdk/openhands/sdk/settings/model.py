@@ -1029,8 +1029,8 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         default=False,
         description=(
             "Enable the built-in classify_and_switch_llm tool, which routes the "
-            "task to the best LLM profile using the active meta-profile. Requires "
-            "active_meta_profile to be set."
+            "task to the best LLM profile using the active meta-profile. When no "
+            "active_meta_profile is set, the first available meta-profile is used."
         ),
         json_schema_extra={
             SETTINGS_METADATA_KEY: SettingsFieldMetadata(
@@ -1167,15 +1167,16 @@ class OpenHandsAgentSettings(AgentSettingsBase):
 
         # The routing tool needs the active meta-profile name, which the
         # name-only ``include_default_tools`` path cannot pass, so add it as a
-        # ``Tool`` spec carrying the param.
+        # ``Tool`` spec carrying the param. When no meta-profile is active, the
+        # tool falls back to the first available one, so we still wire it.
         tools = list(self.tools)
-        if self.enable_classify_and_switch_llm_tool and self.active_meta_profile:
-            tools.append(
-                Tool(
-                    name=ClassifyAndSwitchLLMTool.__name__,
-                    params={"active_meta_profile": self.active_meta_profile},
-                )
+        if self.enable_classify_and_switch_llm_tool:
+            params = (
+                {"active_meta_profile": self.active_meta_profile}
+                if self.active_meta_profile
+                else {}
             )
+            tools.append(Tool(name=ClassifyAndSwitchLLMTool.__name__, params=params))
 
         llm = create_subscription_llm_from_config(self.llm)
         condenser = None if llm.is_subscription else self.build_condenser(llm)

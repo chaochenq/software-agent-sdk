@@ -129,9 +129,34 @@ def test_recent_messages_text_takes_last_n() -> None:
 # ── create() ──────────────────────────────────────────────────────────────
 
 
-def test_create_requires_active_meta_profile(meta_store: MetaProfileStore) -> None:
+def test_create_falls_back_to_first_when_no_active_profile(
+    meta_store: MetaProfileStore,
+) -> None:
+    # "balanced" is the only profile, so it is the first one found.
+    tool = ClassifyAndSwitchLLMTool.create(meta_profile_store=meta_store)[0]
+    assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
+    assert tool.executor.meta_profile.classifier_model == "classifier"
+
+
+def test_create_picks_alphabetically_first_meta_profile(
+    meta_store: MetaProfileStore,
+) -> None:
+    # Add a second profile whose name sorts before "balanced".
+    other = dict(META)
+    other["classifier_model"] = "other-classifier"
+    (Path(meta_store.base_dir) / "aaa.json").write_text(
+        json.dumps(other), encoding="utf-8"
+    )
+    assert meta_store.list()[0] == "aaa"
+    tool = ClassifyAndSwitchLLMTool.create(meta_profile_store=meta_store)[0]
+    assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
+    assert tool.executor.meta_profile.classifier_model == "other-classifier"
+
+
+def test_create_raises_when_no_meta_profiles_exist(tmp_path: Path) -> None:
+    empty_store = MetaProfileStore(base_dir=tmp_path / "empty")
     with pytest.raises(ValueError):
-        ClassifyAndSwitchLLMTool.create(meta_profile_store=meta_store)
+        ClassifyAndSwitchLLMTool.create(meta_profile_store=empty_store)
 
 
 def test_create_rejects_unknown_params(meta_store: MetaProfileStore) -> None:
@@ -248,6 +273,22 @@ def test_create_agent_adds_tool_when_enabled(meta_store, monkeypatch) -> None:
         llm=_make_llm("default-model", "default"),
         enable_classify_and_switch_llm_tool=True,
         active_meta_profile="balanced",
+    ).create_agent()
+
+    assert any(t.name == "ClassifyAndSwitchLLMTool" for t in agent.tools)
+
+
+def test_create_agent_adds_tool_when_enabled_without_active_profile(
+    meta_store, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "openhands.sdk.llm.meta_profile_store._DEFAULT_META_PROFILE_DIR",
+        meta_store.base_dir,
+    )
+    # No active_meta_profile: the tool is still wired and resolves the first one.
+    agent = OpenHandsAgentSettings(
+        llm=_make_llm("default-model", "default"),
+        enable_classify_and_switch_llm_tool=True,
     ).create_agent()
 
     assert any(t.name == "ClassifyAndSwitchLLMTool" for t in agent.tools)

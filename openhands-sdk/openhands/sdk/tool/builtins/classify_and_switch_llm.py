@@ -262,13 +262,23 @@ class ClassifyAndSwitchLLMTool(
                 "ClassifyAndSwitchLLMTool only accepts 'active_meta_profile' "
                 "and 'meta_profile_store'."
             )
-        if not active_meta_profile:
-            raise ValueError(
-                "ClassifyAndSwitchLLMTool requires an 'active_meta_profile' name."
-            )
 
         store = meta_profile_store or MetaProfileStore()
-        meta = store.load(active_meta_profile)
+        name = active_meta_profile
+        if not name:
+            # No meta-profile is active: fall back to the first available one.
+            available = store.list()
+            if not available:
+                raise ValueError(
+                    "ClassifyAndSwitchLLMTool requires at least one meta-profile, "
+                    "but none were found in the meta-profile store."
+                )
+            name = available[0]
+            logger.info(
+                "No active meta-profile set; falling back to first available: %r",
+                name,
+            )
+        meta = store.load(name)
         return [
             cls(
                 description=_DESCRIPTION,
