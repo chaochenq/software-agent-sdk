@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
-from openhands.agent_server.persistence import reset_stores
+from openhands.agent_server.persistence import get_settings_store, reset_stores
 from openhands.sdk.llm.meta_profile_store import MetaProfile, MetaProfileStore
 
 
@@ -154,6 +154,24 @@ def test_delete_active_clears_active(client, store):
     assert listed["active_meta_profile"] is None
 
 
+def test_delete_active_clears_nested_agent_settings(client, store):
+    """Deleting the active meta-profile must clear the *nested* agent settings.
+
+    Otherwise the routing tool stays enabled pointing at a now-deleted profile,
+    which breaks the next conversation. Guards against top-level/nested drift.
+    """
+    store.save("p", MetaProfile.model_validate(_meta()))
+    client.post("/api/meta-profiles/p/activate")
+
+    client.delete("/api/meta-profiles/p")
+
+    persisted = get_settings_store().load()
+    assert persisted is not None
+    agent = persisted.agent_settings
+    assert agent.active_meta_profile is None
+    assert agent.enable_classify_and_switch_llm_tool is False
+
+
 # ── Activate ─────────────────────────────────────────────────────────────────
 
 
@@ -165,6 +183,25 @@ def test_activate_sets_active_meta_profile(client, store):
 
     listed = client.get("/api/meta-profiles").json()
     assert listed["active_meta_profile"] == "p"
+
+
+def test_activate_propagates_into_agent_settings(client, store):
+    """Activation must wire the *nested* agent settings, not just the facade.
+
+    ``enable_classify_and_switch_llm_tool`` / ``active_meta_profile`` on
+    ``agent_settings`` are what actually attach the routing tool; if only the
+    top-level field is set, activation reports success but does nothing.
+    """
+    store.save("p", MetaProfile.model_validate(_meta()))
+    response = client.post("/api/meta-profiles/p/activate")
+    assert response.status_code == 200
+
+    persisted = get_settings_store().load()
+    assert persisted is not None
+    assert persisted.active_meta_profile == "p"
+    agent = persisted.agent_settings
+    assert agent.active_meta_profile == "p"
+    assert agent.enable_classify_and_switch_llm_tool is True
 
 
 def test_activate_missing_returns_404(client):

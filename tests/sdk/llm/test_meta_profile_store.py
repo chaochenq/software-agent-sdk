@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,34 @@ def test_save_respects_max_profiles(tmp_path: Path) -> None:
         "a", MetaProfile(classifier_model="x", default_model="y"), max_profiles=1
     )
     assert store.load("a").classifier_model == "x"
+
+
+def test_concurrent_saves_respect_max_profiles(tmp_path: Path) -> None:
+    """The file lock must serialize the limit check + write across threads.
+
+    Without locking, concurrent creators can each pass the ``max_profiles``
+    check before any write lands and overshoot the limit (TOCTOU).
+    """
+    store = MetaProfileStore(base_dir=tmp_path)
+    limit = 10
+    attempts = 30
+
+    def attempt(i: int) -> bool:
+        try:
+            store.save(
+                f"p{i:02d}",
+                MetaProfile(classifier_model="a", default_model="b"),
+                max_profiles=limit,
+            )
+            return True
+        except MetaProfileLimitExceeded:
+            return False
+
+    with ThreadPoolExecutor(max_workers=attempts) as pool:
+        results = list(pool.map(attempt, range(attempts)))
+
+    assert sum(results) == limit
+    assert len(store.list()) == limit
 
 
 def test_delete_is_idempotent(tmp_path: Path) -> None:

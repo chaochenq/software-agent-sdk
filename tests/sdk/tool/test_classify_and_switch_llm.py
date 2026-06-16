@@ -132,10 +132,11 @@ def test_recent_messages_text_takes_last_n() -> None:
 def test_create_falls_back_to_first_when_no_active_profile(
     meta_store: MetaProfileStore,
 ) -> None:
-    # "balanced" is the only profile, so it is the first one found.
+    # "balanced" is the only profile, so it is the first one resolved.
+    # Resolution is deferred to invocation time, so check the resolver directly.
     tool = ClassifyAndSwitchLLMTool.create(meta_profile_store=meta_store)[0]
     assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
-    assert tool.executor.meta_profile.classifier_model == "classifier"
+    assert tool.executor._resolve_meta_profile().classifier_model == "classifier"
 
 
 def test_create_picks_alphabetically_first_meta_profile(
@@ -150,13 +151,28 @@ def test_create_picks_alphabetically_first_meta_profile(
     assert meta_store.list()[0] == "aaa"
     tool = ClassifyAndSwitchLLMTool.create(meta_profile_store=meta_store)[0]
     assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
-    assert tool.executor.meta_profile.classifier_model == "other-classifier"
+    assert tool.executor._resolve_meta_profile().classifier_model == "other-classifier"
 
 
-def test_create_raises_when_no_meta_profiles_exist(tmp_path: Path) -> None:
+def test_create_does_not_touch_disk_when_no_meta_profiles_exist(
+    tmp_path: Path,
+) -> None:
+    # Deferred resolution: create() must not read the store, so an empty (or
+    # missing) meta-profile dir cannot break agent/conversation startup.
     empty_store = MetaProfileStore(base_dir=tmp_path / "empty")
-    with pytest.raises(ValueError):
-        ClassifyAndSwitchLLMTool.create(meta_profile_store=empty_store)
+    tools = ClassifyAndSwitchLLMTool.create(meta_profile_store=empty_store)
+    assert len(tools) == 1
+    assert isinstance(tools[0].executor, ClassifyAndSwitchLLMExecutor)
+
+
+def test_create_does_not_load_missing_active_meta_profile(
+    meta_store: MetaProfileStore,
+) -> None:
+    # A dangling active_meta_profile must not raise at create() time.
+    tool = ClassifyAndSwitchLLMTool.create(
+        active_meta_profile="does-not-exist", meta_profile_store=meta_store
+    )[0]
+    assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
 
 
 def test_create_rejects_unknown_params(meta_store: MetaProfileStore) -> None:
@@ -174,7 +190,7 @@ def test_create_loads_meta_profile(meta_store: MetaProfileStore) -> None:
     )[0]
     assert tool.name == "classify_and_switch_llm"
     assert isinstance(tool.executor, ClassifyAndSwitchLLMExecutor)
-    assert tool.executor.meta_profile.classifier_model == "classifier"
+    assert tool.executor._resolve_meta_profile().classifier_model == "classifier"
 
 
 # ── executor ──────────────────────────────────────────────────────────────
@@ -259,6 +275,66 @@ def test_executor_errors_when_target_profile_missing(
     assert obs.is_error
     assert obs.model == "slow"
     assert "not found" in obs.text
+
+
+def test_executor_errors_when_no_meta_profile_available(
+    profile_store, tmp_path
+) -> None:
+    # Empty store + no active profile: invocation (not startup) reports the error.
+    empty_store = MetaProfileStore(base_dir=tmp_path / "empty")
+    conversation = _make_conversation()
+    tool = ClassifyAndSwitchLLMTool.create(meta_profile_store=empty_store)[0]
+    conversation._ensure_agent_ready()
+    conversation.agent.tools_map[tool.name] = tool
+
+    obs = conversation.execute_tool(
+        "classify_and_switch_llm", ClassifyAndSwitchLLMAction()
+    )
+
+    assert obs.is_error
+    assert "no meta-profile" in obs.text.lower()
+    assert conversation.agent.llm.model == "default-model"
+
+
+def test_executor_errors_when_active_meta_profile_missing(
+    profile_store, meta_store
+) -> None:
+    # Dangling active_meta_profile: invocation reports the error, no crash.
+    conversation = _make_conversation()
+    tool = ClassifyAndSwitchLLMTool.create(
+        active_meta_profile="does-not-exist", meta_profile_store=meta_store
+    )[0]
+    conversation._ensure_agent_ready()
+    conversation.agent.tools_map[tool.name] = tool
+
+    obs = conversation.execute_tool(
+        "classify_and_switch_llm", ClassifyAndSwitchLLMAction()
+    )
+
+    assert obs.is_error
+    assert "resolve" in obs.text.lower()
+
+
+def test_missing_active_meta_profile_does_not_break_startup(
+    meta_store, monkeypatch
+) -> None:
+    # The whole point of deferring the load: a missing active meta-profile must
+    # not break _ensure_agent_ready() / conversation startup.
+    monkeypatch.setattr(
+        "openhands.sdk.llm.meta_profile_store._DEFAULT_META_PROFILE_DIR",
+        meta_store.base_dir,
+    )
+    agent = OpenHandsAgentSettings(
+        llm=_make_llm("default-model", "default"),
+        enable_classify_and_switch_llm_tool=True,
+        active_meta_profile="does-not-exist",
+    ).create_agent()
+    conversation = LocalConversation(agent=agent, workspace=Path.cwd())
+
+    # Must not raise even though the active meta-profile file does not exist.
+    conversation._ensure_agent_ready()
+
+    assert any(t.name == "ClassifyAndSwitchLLMTool" for t in agent.tools)
 
 
 # ── create_agent wiring ─────────────────────────────────────────────────────

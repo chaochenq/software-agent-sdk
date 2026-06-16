@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
 
+from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from openhands.sdk.llm.llm_profile_store import PROFILE_NAME_REGEX
@@ -25,6 +28,7 @@ from openhands.sdk.logger import get_logger
 
 
 _DEFAULT_META_PROFILE_DIR: Final[Path] = Path.home() / ".openhands" / "meta-profiles"
+_LOCK_TIMEOUT_SECONDS: Final[float] = 30.0
 
 logger = get_logger(__name__)
 
@@ -75,6 +79,28 @@ class MetaProfileStore:
             Path(base_dir) if base_dir is not None else _DEFAULT_META_PROFILE_DIR
         )
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._file_lock = FileLock(self.base_dir / ".meta-profiles.lock")
+
+    @contextmanager
+    def _acquire_lock(self, timeout: float = _LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
+        """Acquire the file lock for safe concurrent access.
+
+        The lock is reentrant within a process, so methods that hold it may
+        call other locked methods (e.g. ``save`` calls ``list``).
+
+        Raises:
+            TimeoutError: If the lock cannot be acquired within ``timeout``.
+        """
+        try:
+            with self._file_lock.acquire(timeout=timeout):
+                yield
+        except Timeout:
+            logger.error(
+                f"[Meta-profile Store] Failed to acquire lock within {timeout}s"
+            )
+            raise TimeoutError(
+                f"Meta-profile store lock acquisition timed out after {timeout}s"
+            )
 
     def list(self) -> list[str]:
         """Return the names (without ``.json``) of all stored meta-profiles."""
@@ -136,28 +162,32 @@ class MetaProfileStore:
         """
         path = self._get_path(name)
 
-        if max_profiles is not None and not path.exists():
-            if len(self.list()) >= max_profiles:
-                raise MetaProfileLimitExceeded(
-                    f"Meta-profile limit reached ({max_profiles})."
-                )
+        # Hold the lock across the precondition check and the atomic replace so
+        # concurrent creators cannot both pass the limit check and overshoot
+        # ``max_profiles`` (TOCTOU), mirroring ``LLMProfileStore``.
+        with self._acquire_lock():
+            if max_profiles is not None and not path.exists():
+                if len(self.list()) >= max_profiles:
+                    raise MetaProfileLimitExceeded(
+                        f"Meta-profile limit reached ({max_profiles})."
+                    )
 
-        profile_json = json.dumps(meta_profile.model_dump(mode="json"), indent=2)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=self.base_dir,
-            suffix=".tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            tmp.write(profile_json)
-            tmp_path = Path(tmp.name)
+            profile_json = json.dumps(meta_profile.model_dump(mode="json"), indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self.base_dir,
+                suffix=".tmp",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                tmp.write(profile_json)
+                tmp_path = Path(tmp.name)
 
-        try:
-            Path.replace(tmp_path, path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+            try:
+                Path.replace(tmp_path, path)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
         logger.info(f"Saved meta-profile `{name}` at {path}")
 
     def delete(self, name: str) -> None:
@@ -167,10 +197,11 @@ class MetaProfileStore:
             ValueError: If ``name`` is not a valid meta-profile name.
         """
         path = self._get_path(name)
-        if not path.exists():
-            logger.info(f"Meta-profile `{name}` not found. Skipping delete.")
-            return
-        path.unlink()
+        with self._acquire_lock():
+            if not path.exists():
+                logger.info(f"Meta-profile `{name}` not found. Skipping delete.")
+                return
+            path.unlink()
         logger.info(f"Deleted meta-profile `{name}`")
 
     def list_summaries(self) -> list[dict[str, Any]]:

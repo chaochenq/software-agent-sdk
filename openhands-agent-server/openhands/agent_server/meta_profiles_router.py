@@ -88,7 +88,11 @@ def _set_active_meta_profile_if_matches(
         return False
 
     def update_active(settings: PersistedSettings) -> PersistedSettings:
-        settings.active_meta_profile = new_name
+        # Route through PersistedSettings.update() so the change also
+        # propagates into agent_settings (active_meta_profile +
+        # enable_classify_and_switch_llm_tool); a direct field assignment
+        # would leave that nested state stale.
+        settings.update({"active_meta_profile": new_name})
         return settings
 
     settings_store.update(update_active)
@@ -209,7 +213,11 @@ async def activate_meta_profile(
     settings_store = get_settings_store(config)
 
     def apply_active(settings: PersistedSettings) -> PersistedSettings:
-        settings.active_meta_profile = name
+        # Route through PersistedSettings.update() so activation also wires
+        # agent_settings (active_meta_profile + enable_classify_and_switch_llm_tool),
+        # which is what actually attaches the routing tool. A direct field
+        # assignment would record the active name but never enable the tool.
+        settings.update({"active_meta_profile": name})
         return settings
 
     try:

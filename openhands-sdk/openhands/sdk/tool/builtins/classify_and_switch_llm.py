@@ -131,8 +131,38 @@ def _recent_messages_text(
 
 
 class ClassifyAndSwitchLLMExecutor(ToolExecutor):
-    def __init__(self, meta_profile: MetaProfile) -> None:
-        self.meta_profile = meta_profile
+    def __init__(
+        self,
+        meta_profile_store: MetaProfileStore,
+        active_meta_profile: str | None = None,
+    ) -> None:
+        # Resolve the meta-profile lazily (at invocation), not at construction,
+        # so a missing/renamed file under ~/.openhands/meta-profiles produces a
+        # tool error instead of breaking conversation startup.
+        self._store = meta_profile_store
+        self._active_meta_profile = active_meta_profile
+
+    def _resolve_meta_profile(self) -> MetaProfile:
+        """Resolve the active meta-profile, falling back to the first available.
+
+        Raises:
+            FileNotFoundError: If no meta-profile can be resolved.
+            ValueError: If the resolved meta-profile is invalid.
+        """
+        name = self._active_meta_profile
+        if not name:
+            available = self._store.list()
+            if not available:
+                raise FileNotFoundError(
+                    "No meta-profile is active and none are available in the "
+                    "meta-profile store."
+                )
+            name = available[0]
+            logger.info(
+                "No active meta-profile set; falling back to first available: %r",
+                name,
+            )
+        return self._store.load(name)
 
     def __call__(
         self,
@@ -147,7 +177,13 @@ class ClassifyAndSwitchLLMExecutor(ToolExecutor):
                 is_error=True,
             )
 
-        meta = self.meta_profile
+        try:
+            meta = self._resolve_meta_profile()
+        except (FileNotFoundError, ValueError) as exc:
+            return ClassifyAndSwitchLLMObservation.from_text(
+                text=f"Failed to resolve the active meta-profile: {exc}",
+                is_error=True,
+            )
         # 1) Load the classifier LLM (a saved profile), respecting at-rest cipher.
         try:
             classifier_llm = conversation._profile_store.load(
@@ -263,28 +299,17 @@ class ClassifyAndSwitchLLMTool(
                 "and 'meta_profile_store'."
             )
 
+        # Meta-profile resolution is deferred to invocation time (see
+        # ClassifyAndSwitchLLMExecutor) so user-managed files under
+        # ~/.openhands/meta-profiles cannot break conversation startup; a
+        # missing/invalid profile surfaces as a tool error instead.
         store = meta_profile_store or MetaProfileStore()
-        name = active_meta_profile
-        if not name:
-            # No meta-profile is active: fall back to the first available one.
-            available = store.list()
-            if not available:
-                raise ValueError(
-                    "ClassifyAndSwitchLLMTool requires at least one meta-profile, "
-                    "but none were found in the meta-profile store."
-                )
-            name = available[0]
-            logger.info(
-                "No active meta-profile set; falling back to first available: %r",
-                name,
-            )
-        meta = store.load(name)
         return [
             cls(
                 description=_DESCRIPTION,
                 action_type=ClassifyAndSwitchLLMAction,
                 observation_type=ClassifyAndSwitchLLMObservation,
-                executor=ClassifyAndSwitchLLMExecutor(meta),
+                executor=ClassifyAndSwitchLLMExecutor(store, active_meta_profile),
                 annotations=ToolAnnotations(
                     readOnlyHint=False,
                     destructiveHint=False,
