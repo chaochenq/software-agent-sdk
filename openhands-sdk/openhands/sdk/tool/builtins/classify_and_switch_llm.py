@@ -192,19 +192,31 @@ class ClassifyAndSwitchLLMExecutor(ToolExecutor):
                 text=f"Failed to resolve the active meta-profile: {exc}",
                 is_error=True,
             )
-        # 1) Load the classifier LLM (a saved profile), respecting at-rest cipher.
+        # 1) Load the classifier LLM (a saved profile), respecting at-rest cipher,
+        #    and register it in the conversation's LLM registry under a stable
+        #    usage id. Registration is what makes the classifier completion's
+        #    tokens/cost flow into ``conversation.conversation_stats`` and count
+        #    against ``max_budget_per_run`` — calling an unregistered LLM would
+        #    spend off the books (mirrors the ``ask-agent-llm`` pattern). Caching
+        #    by usage id means repeated routing calls reuse one metrics bucket.
+        usage_id = f"classifier:{meta.classifier_model}"
         try:
-            classifier_llm = conversation._profile_store.load(
-                meta.classifier_model, cipher=conversation._cipher
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            return ClassifyAndSwitchLLMObservation.from_text(
-                text=(
-                    f"Failed to load classifier profile "
-                    f"'{meta.classifier_model}': {exc}"
-                ),
-                is_error=True,
-            )
+            classifier_llm = conversation.llm_registry.get(usage_id)
+        except KeyError:
+            try:
+                loaded = conversation._profile_store.load(
+                    meta.classifier_model, cipher=conversation._cipher
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                return ClassifyAndSwitchLLMObservation.from_text(
+                    text=(
+                        f"Failed to load classifier profile "
+                        f"'{meta.classifier_model}': {exc}"
+                    ),
+                    is_error=True,
+                )
+            classifier_llm = loaded.model_copy(update={"usage_id": usage_id})
+            conversation.llm_registry.add(classifier_llm)
 
         # 2) Single classifier call over the recent conversation.
         transcript = _recent_messages_text(conversation) or "(no messages yet)"

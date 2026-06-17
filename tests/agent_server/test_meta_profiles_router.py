@@ -132,6 +132,18 @@ def test_save_invalid_name_returns_422(client):
     assert response.status_code == 422
 
 
+def test_save_timeout_returns_503(client, monkeypatch):
+    """Save surfaces store lock TimeoutError as a retryable 503, not a 500."""
+
+    def boom(self, name, meta_profile, *, max_profiles=None):
+        raise TimeoutError("locked")
+
+    monkeypatch.setattr(MetaProfileStore, "save", boom)
+
+    response = client.post("/api/meta-profiles/anything", json=_meta())
+    assert response.status_code == 503
+
+
 # ── Delete ───────────────────────────────────────────────────────────────────
 
 
@@ -145,6 +157,18 @@ def test_delete_meta_profile(client, store):
 def test_delete_is_idempotent(client):
     response = client.delete("/api/meta-profiles/nope")
     assert response.status_code == 200
+
+
+def test_delete_timeout_returns_503(client, monkeypatch):
+    """Delete surfaces store lock TimeoutError as a retryable 503, not a 500."""
+
+    def boom(self, name):
+        raise TimeoutError("locked")
+
+    monkeypatch.setattr(MetaProfileStore, "delete", boom)
+
+    response = client.delete("/api/meta-profiles/anything")
+    assert response.status_code == 503
 
 
 def test_delete_active_clears_active(client, store):

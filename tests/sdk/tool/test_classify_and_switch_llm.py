@@ -224,6 +224,50 @@ def test_executor_switches_to_matched_class(
     assert conversation.agent.llm.model == "fast-model"
 
 
+def test_classifier_call_is_accounted_in_conversation_stats(
+    profile_store, meta_store, monkeypatch
+) -> None:
+    """The classifier completion must spend through the conversation registry.
+
+    Regression for the budget-bypass bug: the classifier LLM has to be
+    registered in ``conversation.llm_registry`` (under a stable usage id) so its
+    tokens/cost land in ``conversation_stats`` and count against
+    ``max_budget_per_run`` — an unregistered LLM would spend off the books.
+    """
+    conversation = _make_conversation()
+    _register_tool(conversation, meta_store)
+    _patch_classifier(conversation, monkeypatch, reply="1")
+
+    usage_id = "classifier:classifier"
+    assert usage_id not in conversation.conversation_stats.usage_to_metrics
+
+    obs = conversation.execute_tool(
+        "classify_and_switch_llm", ClassifyAndSwitchLLMAction()
+    )
+
+    assert isinstance(obs, ClassifyAndSwitchLLMObservation)
+    assert not obs.is_error
+    # The classifier LLM is now both registered and tracked by the stats, so
+    # its spend is included in the combined (budget-enforced) metrics.
+    assert usage_id in conversation.llm_registry.list_usage_ids()
+    assert usage_id in conversation.conversation_stats.usage_to_metrics
+
+
+def test_repeated_routing_reuses_one_classifier_usage_bucket(
+    profile_store, meta_store, monkeypatch
+) -> None:
+    """A second routing call must reuse the cached classifier, not re-register."""
+    conversation = _make_conversation()
+    _register_tool(conversation, meta_store)
+    _patch_classifier(conversation, monkeypatch, reply="1")
+
+    conversation.execute_tool("classify_and_switch_llm", ClassifyAndSwitchLLMAction())
+    conversation.execute_tool("classify_and_switch_llm", ClassifyAndSwitchLLMAction())
+
+    usage_ids = conversation.llm_registry.list_usage_ids()
+    assert usage_ids.count("classifier:classifier") == 1
+
+
 def test_executor_falls_back_to_default_when_no_class(
     profile_store, meta_store, monkeypatch
 ) -> None:

@@ -66,9 +66,17 @@ class ActivateMetaProfileResponse(BaseModel):
 
 @contextmanager
 def _store_errors() -> Iterator[None]:
-    """Map ``MetaProfileStore`` validation errors to HTTP responses."""
+    """Map ``MetaProfileStore`` errors to HTTP responses."""
     try:
         yield
+    except TimeoutError:
+        # save()/delete() can raise TimeoutError from the file lock under
+        # contention; surface a retryable 503 instead of a generic 500
+        # (mirrors profiles_router._store_errors()).
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Meta-profile store is busy. Please retry.",
+        )
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
