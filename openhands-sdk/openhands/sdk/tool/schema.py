@@ -176,6 +176,12 @@ class Schema(DiscriminatedUnionMixin):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
 
     @classmethod
+    def _discriminator_field_names(cls) -> set[str]:
+        return set(DiscriminatedUnionMixin.model_fields.keys()) | set(
+            DiscriminatedUnionMixin.model_computed_fields.keys()
+        )
+
+    @classmethod
     def to_mcp_schema(cls) -> dict[str, Any]:
         """Convert to JSON schema format compatible with MCP."""
         full_schema = cls.model_json_schema()
@@ -185,11 +191,18 @@ class Schema(DiscriminatedUnionMixin):
 
         # Remove discriminator fields from properties (not for LLM)
         # Need to exclude both regular fields and computed fields (like 'kind')
-        exclude_fields = set(DiscriminatedUnionMixin.model_fields.keys()) | set(
-            DiscriminatedUnionMixin.model_computed_fields.keys()
-        )
+        exclude_fields = cls._discriminator_field_names()
+        explicit_mcp_aliases = {
+            field_info.alias
+            for field_name, field_info in cls.model_fields.items()
+            if field_info.alias and field_info.alias != field_name
+        }
         for f in exclude_fields:
-            if "properties" in result and f in result["properties"]:
+            if (
+                "properties" in result
+                and f in result["properties"]
+                and f not in explicit_mcp_aliases
+            ):
                 result["properties"].pop(f)
                 # Also remove from required if present
                 if "required" in result and f in result["required"]:
@@ -213,12 +226,27 @@ class Schema(DiscriminatedUnionMixin):
         required = set(schema.get("required", []) or [])
 
         fields: dict[str, tuple] = {}
+        discriminator_fields = cls._discriminator_field_names()
+        used_field_names = set(props.keys())
         for fname, spec in props.items():
             spec = spec if isinstance(spec, dict) else {}
             tp = py_type(spec)
 
             # Add description if present
             desc: str | None = spec.get("description")
+            field_name = fname
+            field_alias = None
+            if fname in discriminator_fields:
+                # MCP tool argument names are user-defined JSON object keys. If
+                # one collides with OpenHands' internal discriminator (e.g.
+                # "kind"), keep the external name as an alias and use a safe
+                # internal field name for Pydantic.
+                field_alias = fname
+                field_name = f"mcp_arg_{fname}"
+                suffix = 2
+                while field_name in used_field_names or field_name in fields:
+                    field_name = f"mcp_arg_{fname}_{suffix}"
+                    suffix += 1
 
             # Required → bare type, ellipsis sentinel
             # Optional → make nullable via `| None`, default None
@@ -229,11 +257,15 @@ class Schema(DiscriminatedUnionMixin):
                 anno = tp | None  # allow explicit null in addition to omission
                 default = None
 
-            fields[fname] = (
+            field_kwargs: dict[str, Any] = {}
+            if desc:
+                field_kwargs["description"] = desc
+            if field_alias:
+                field_kwargs["alias"] = field_alias
+
+            fields[field_name] = (
                 anno,
-                Field(default=default, description=desc)
-                if desc
-                else Field(default=default),
+                Field(default=default, **field_kwargs),
             )
 
         return create_model(model_name, __base__=cls, **fields)  # type: ignore[return-value]

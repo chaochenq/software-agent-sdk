@@ -270,7 +270,11 @@ class MCPToolDefinition(ToolDefinition[MCPToolAction, MCPToolObservation]):
         exclude_fields = set(DiscriminatedUnionMixin.model_fields.keys()) | set(
             DiscriminatedUnionMixin.model_computed_fields.keys()
         )
-        sanitized = validated.model_dump(exclude_none=True, exclude=exclude_fields)
+        sanitized = validated.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            exclude=exclude_fields,
+        )
         return MCPToolAction(data=sanitized)
 
     @classmethod

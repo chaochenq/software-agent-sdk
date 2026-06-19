@@ -206,14 +206,21 @@ class DiscriminatedUnionMixin(OpenHandsModel):
     ) -> Self:
         if isinstance(data, cls):
             return data
-        kind = data.pop("kind", None)
         if not _is_abstract(cls):
+            has_kind_alias_field = any(
+                field_name != "kind" and field_info.alias == "kind"
+                for field_name, field_info in cls.model_fields.items()
+            )
+            if has_kind_alias_field:
+                return handler(data)
+            kind = data.pop("kind", None)
             # Sanity check: if we're validating a concrete class directly,
             # the kind (if provided) should match the class name. This should
             # always be true at this point since resolve_kind() would have
             # already routed to the correct subclass.
             assert kind is None or kind == cls.__name__
             return handler(data)
+        kind = data.pop("kind", None)
         if kind is None:
             subclasses = _get_checked_concrete_subclasses(cls)
             if not subclasses:
