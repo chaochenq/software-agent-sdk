@@ -405,10 +405,11 @@ class TerminalSession(TerminalSessionBase):
         if not self._initialized:
             raise RuntimeError("Unified session is not initialized")
 
-        # Strip the command of any leading/trailing whitespace
         logger.debug(f"RECEIVED ACTION: {action}")
-        command = action.command.strip()
         is_input: bool = action.is_input
+        # Strip shell commands, but preserve stdin bytes as-is so whitespace-
+        # significant input (leading spaces, multiple newlines) reaches the process.
+        command = action.command if is_input else action.command.strip()
 
         rejection = foreground_timeout_rejection_for(
             command=command,

@@ -39,6 +39,10 @@ class ExecCommandExecutor(
         action: ExecCommandAction,
         conversation: LocalConversation | None = None,
     ) -> InteractiveTerminalObservation:
+        # TODO: pre-export secrets referenced by cmd so `echo $MY_SECRET` works.
+        # TerminalTool does this via `_export_envs()` before running each command.
+        # Adding the same here requires running a pre-command export in the new
+        # session, which needs shell-type detection.  Track in follow-up issue.
         output, wall, session_id, exit_code = self._manager.exec_command(
             action.cmd,
             workdir=action.workdir,

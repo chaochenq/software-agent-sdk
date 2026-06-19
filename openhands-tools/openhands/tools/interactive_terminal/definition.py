@@ -242,6 +242,14 @@ call ``write_stdin(session_id=...)`` to:
 
 When the response contains ``exit_code``, the process has finished.
 
+### Known limitations
+
+* **Secret injection**: Unlike ``TerminalTool``, registered secrets are not
+  automatically exported into the command environment before execution.
+  Reference secrets explicitly in the command (e.g. ``cmd="echo $API_KEY"``
+  will not expand ``$API_KEY`` from the secret registry).  Output masking
+  (hiding secret values in observations) still applies.
+
 ### Background-monitoring pattern
 
 ```python
