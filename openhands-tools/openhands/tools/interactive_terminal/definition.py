@@ -80,9 +80,14 @@ class WriteStdinAction(Action):
     chars: str = Field(
         default="",
         description=(
-            "Bytes to write to stdin. "
+            "Characters to send to stdin. "
             "Omit (or pass empty string) to poll without writing. "
-            "Use \\x03 for Ctrl+C, \\x04 for Ctrl+D, \\x1a for Ctrl+Z."
+            "Use \\x03 for Ctrl+C, \\x04 for Ctrl+D, \\x1a for Ctrl+Z. "
+            "Non-newline-terminated input has Enter appended by the terminal "
+            "backend: chars='abc' delivers 'abc\\n', chars='abc\\n' delivers "
+            "'abc\\n' (no double Enter). "
+            "Append '\\n' explicitly when Enter is desired; omit it only for "
+            "special keys mapped by \\x03/\\x04/\\x1a."
         ),
     )
     yield_time_ms: int = Field(
@@ -270,9 +275,18 @@ Pass ``session_id`` from a previous ``exec_command`` call.
   returns all new output.  Useful for checking on a background process.
 * **Send input** (non-empty ``chars``) — writes to stdin, then waits
   ``yield_time_ms`` for a response.  Common values:
-    * ``"y\\n"`` — confirm a prompt
+    * ``"y\\n"`` — confirm a prompt (Enter included)
     * ``"\\x03"`` — Ctrl+C (interrupt)
     * ``"\\x04"`` — Ctrl+D (EOF)
+
+  .. note::
+      The terminal backend appends an Enter keystroke when ``chars`` does **not**
+      already end with ``'\\n'``.  So ``chars="abc"`` delivers ``"abc\\n"`` and
+      ``chars="abc\\n"`` also delivers ``"abc\\n"`` (no double Enter).
+      This matches the typical shell/REPL use case where Enter submits input.
+      If raw byte delivery without Enter is required, this tool cannot currently
+      guarantee it — use the standard ``terminal`` tool or append ``\\n``
+      explicitly and accept the Enter.
 
 The response always reports whether the session is still running
 (``session_id`` present) or has finished (``exit_code`` present).

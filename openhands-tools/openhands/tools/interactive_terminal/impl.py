@@ -17,14 +17,21 @@ from openhands.tools.terminal.terminal import TerminalSession, create_terminal_s
 _per_conversation_managers: WeakValueDictionary[str, "InteractiveTerminalManager"] = (
     WeakValueDictionary()
 )
+_managers_lock = threading.Lock()
 
 
 def get_or_create_manager(conv_id: str, work_dir: str) -> "InteractiveTerminalManager":
-    """Return the shared manager for *conv_id*, creating one if necessary."""
-    manager = _per_conversation_managers.get(conv_id)
-    if manager is None:
-        manager = InteractiveTerminalManager(work_dir)
-        _per_conversation_managers[conv_id] = manager
+    """Return the shared manager for *conv_id*, creating one if necessary.
+
+    The lock prevents a TOCTOU race where two concurrent create() calls for the
+    same conv_id could each see None and allocate separate managers, leaving one
+    orphaned with permanently unreachable sessions.
+    """
+    with _managers_lock:
+        manager = _per_conversation_managers.get(conv_id)
+        if manager is None:
+            manager = InteractiveTerminalManager(work_dir)
+            _per_conversation_managers[conv_id] = manager
     return manager
 
 
@@ -142,9 +149,12 @@ class InteractiveTerminalManager:
             if mapped is not None:
                 action = TerminalAction(command=mapped, is_input=True, timeout=yield_s)
             else:
-                # Pass chars as-is.  The tmux send_keys implementation adds an Enter
-                # keystroke only when the text does NOT already end with '\n', so
-                # multi-newline sequences ("a\n\n") are preserved correctly.
+                # Pass chars as-is.  The tmux send_keys path appends an Enter
+                # keystroke when chars does NOT already end with '\n', matching
+                # the typical shell/REPL pattern where Enter submits the input.
+                # Consequence: chars="abc" delivers "abc\n"; chars="abc\n" delivers
+                # "abc\n" (no double Enter).  If raw bytes without Enter are needed,
+                # end chars with any other character and avoid tmux send_keys.
                 action = TerminalAction(command=chars, is_input=True, timeout=yield_s)
 
         t0 = time.monotonic()
