@@ -25,6 +25,8 @@ def _mask_output(output: str, conversation: LocalConversation | None) -> str:
         masked = conversation.state.secret_registry.mask_secrets_in_output(output)
         return masked or output
     except Exception:  # noqa: BLE001
+        # Masking must never break tool execution — return raw output on any error
+        # (e.g. malformed registry state, missing attribute on mock objects in tests).
         return output
 
 
@@ -43,15 +45,17 @@ class ExecCommandExecutor(
         # TerminalTool does this via `_export_envs()` before running each command.
         # Adding the same here requires running a pre-command export in the new
         # session, which needs shell-type detection.  Track in follow-up issue.
-        output, wall, session_id, exit_code = self._manager.exec_command(
-            action.cmd,
-            workdir=action.workdir,
-            yield_time_ms=action.yield_time_ms,
-            max_output_tokens=action.max_output_tokens,
+        output, wall, session_id, exit_code, original_token_count = (
+            self._manager.exec_command(
+                action.cmd,
+                workdir=action.workdir,
+                yield_time_ms=action.yield_time_ms,
+                max_output_tokens=action.max_output_tokens,
+            )
         )
         output = _mask_output(output, conversation)
         return InteractiveTerminalObservation.create(
-            output, wall, session_id, exit_code
+            output, wall, session_id, exit_code, original_token_count
         )
 
     def close(self) -> None:
@@ -72,15 +76,17 @@ class WriteStdinExecutor(
         action: WriteStdinAction,
         conversation: LocalConversation | None = None,
     ) -> InteractiveTerminalObservation:
-        output, wall, session_id, exit_code = self._manager.write_stdin(
-            action.session_id,
-            chars=action.chars,
-            yield_time_ms=action.yield_time_ms,
-            max_output_tokens=action.max_output_tokens,
+        output, wall, session_id, exit_code, original_token_count = (
+            self._manager.write_stdin(
+                action.session_id,
+                chars=action.chars,
+                yield_time_ms=action.yield_time_ms,
+                max_output_tokens=action.max_output_tokens,
+            )
         )
         output = _mask_output(output, conversation)
         return InteractiveTerminalObservation.create(
-            output, wall, session_id, exit_code
+            output, wall, session_id, exit_code, original_token_count
         )
 
     def close(self) -> None:

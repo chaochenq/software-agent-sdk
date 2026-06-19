@@ -158,9 +158,8 @@ class InteractiveTerminalObservation(Observation):
         wall_time_seconds: float,
         session_id: int | None,
         exit_code: int | None,
+        original_token_count: int | None = None,
     ) -> InteractiveTerminalObservation:
-        raw_chars = len(output)
-        approx_tokens = raw_chars // 4 or None
         header = _format_header(session_id, exit_code, wall_time_seconds)
         full_text = f"{header}\n{output}" if output else header
         return cls.from_text(
@@ -169,7 +168,7 @@ class InteractiveTerminalObservation(Observation):
             wall_time_seconds=wall_time_seconds,
             session_id=session_id,
             exit_code=exit_code,
-            original_token_count=approx_tokens,
+            original_token_count=original_token_count,
         )
 
     @property

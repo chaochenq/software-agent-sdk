@@ -118,6 +118,37 @@ def test_toolset_accessible_via_tool_registry(tmp_dir):
     _ = agent  # agent was constructed successfully
 
 
+@_unix_only
+def test_toolset_shares_manager_across_tools(tmp_dir):
+    """exec_command and write_stdin from the same toolset share a manager.
+
+    This is the key invariant introduced by get_or_create_manager: session IDs
+    returned by exec_command must be valid for write_stdin from the same creation.
+    """
+    state = _conv_state(tmp_dir)
+    tools = InteractiveTerminalToolSet.create(state)
+    exec_tool = next(t for t in tools if t.name == "exec_command")
+    write_tool = next(t for t in tools if t.name == "write_stdin")
+
+    # Start a slow command — should return session_id
+    exec_obs = exec_tool(ExecCommandAction(cmd="sleep 60", yield_time_ms=500))
+    assert isinstance(exec_obs, InteractiveTerminalObservation)
+    assert exec_obs.session_id is not None
+
+    # write_stdin must be able to find the session using the same session_id
+    poll_obs = write_tool(WriteStdinAction(session_id=exec_obs.session_id))
+    assert isinstance(poll_obs, InteractiveTerminalObservation)
+    # If the manager is shared, the session exists and we still get session_id back
+    assert poll_obs.session_id == exec_obs.session_id
+
+    # Cleanup
+    write_tool(
+        WriteStdinAction(
+            session_id=exec_obs.session_id, chars="\x03", yield_time_ms=500
+        )
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Manager unit tests — exec_command
 # ──────────────────────────────────────────────────────────────────────────────
@@ -125,7 +156,7 @@ def test_toolset_accessible_via_tool_registry(tmp_dir):
 
 def test_fast_command_returns_exit_code(manager):
     """Fast command finishes inline, returns exit_code (not session_id)."""
-    out, wall, sid, ec = manager.exec_command("echo hello", yield_time_ms=5_000)
+    out, wall, sid, ec, _ = manager.exec_command("echo hello", yield_time_ms=5_000)
 
     assert sid is None, "session_id must be absent when process finishes"
     assert ec == 0
@@ -136,7 +167,7 @@ def test_fast_command_returns_exit_code(manager):
 @_unix_only
 def test_fast_command_nonzero_exit_code(manager):
     # Use a bash subshell so the shell session itself is not terminated.
-    out, wall, sid, ec = manager.exec_command("(exit 42)", yield_time_ms=5_000)
+    out, wall, sid, ec, _ = manager.exec_command("(exit 42)", yield_time_ms=5_000)
 
     assert sid is None
     assert ec == 42
@@ -144,7 +175,7 @@ def test_fast_command_nonzero_exit_code(manager):
 
 def test_slow_command_returns_session_id(manager):
     """A command that outlasts yield_time_ms returns session_id (not exit_code)."""
-    out, wall, sid, ec = manager.exec_command("sleep 60", yield_time_ms=500)
+    out, wall, sid, ec, _ = manager.exec_command("sleep 60", yield_time_ms=500)
 
     assert ec is None, "exit_code must be absent while process is running"
     assert sid is not None
@@ -162,7 +193,9 @@ def test_exec_command_workdir(tmp_dir, manager):
     sub = os.path.join(tmp_dir, "subdir")
     os.makedirs(sub, exist_ok=True)
 
-    out, _wall, _sid, ec = manager.exec_command("pwd", workdir=sub, yield_time_ms=5_000)
+    out, _wall, _sid, ec, _ = manager.exec_command(
+        "pwd", workdir=sub, yield_time_ms=5_000
+    )
 
     assert ec == 0
     assert sub in out
@@ -170,8 +203,8 @@ def test_exec_command_workdir(tmp_dir, manager):
 
 def test_exec_command_each_creates_new_session(manager):
     """Two exec_command calls must produce distinct session IDs."""
-    _, _, sid1, _ = manager.exec_command("sleep 60", yield_time_ms=500)
-    _, _, sid2, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid1, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid2, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
 
     assert sid1 is not None
     assert sid2 is not None
@@ -184,7 +217,7 @@ def test_exec_command_each_creates_new_session(manager):
 
 def test_max_output_tokens_truncates_output(manager):
     # Generate ~100 chars of output and limit to ~5 tokens (20 chars)
-    out, _w, _sid, ec = manager.exec_command(
+    out, _w, _sid, ec, _ = manager.exec_command(
         "python3 -c \"print('x' * 200)\"",
         yield_time_ms=5_000,
         max_output_tokens=5,  # 5 tokens * 4 chars = 20 chars max
@@ -200,7 +233,7 @@ def test_max_output_tokens_truncates_output(manager):
 
 def test_write_stdin_unknown_session(manager):
     """write_stdin on a non-existent session returns a meaningful error message."""
-    out, wall, sid, ec = manager.write_stdin(999, yield_time_ms=500)
+    out, wall, sid, ec, _ = manager.write_stdin(999, yield_time_ms=500)
 
     assert sid is None
     assert ec is None
@@ -217,10 +250,12 @@ def test_write_stdin_unknown_session(manager):
 
 def test_write_stdin_polls_running_process(manager):
     """Empty-char poll returns session_id while process is still running."""
-    _, _, sid, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
     assert sid is not None
 
-    out_p, wall_p, sid_p, ec_p = manager.write_stdin(sid, chars="", yield_time_ms=5_000)
+    out_p, wall_p, sid_p, ec_p, _ = manager.write_stdin(
+        sid, chars="", yield_time_ms=5_000
+    )
 
     assert ec_p is None
     assert sid_p == sid
@@ -234,10 +269,10 @@ def test_write_stdin_polls_running_process(manager):
 @_unix_only
 def test_write_stdin_interrupt_ctrl_c(manager):
     """Sending Ctrl+C (\\x03) stops the running process."""
-    _, _, sid, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
     assert sid is not None
 
-    out, wall, sid_after, ec = manager.write_stdin(
+    out, wall, sid_after, ec, _ = manager.write_stdin(
         sid, chars="\x03", yield_time_ms=2_000
     )
 
@@ -249,14 +284,14 @@ def test_write_stdin_interrupt_ctrl_c(manager):
 @_unix_only
 def test_write_stdin_session_removed_after_completion(manager):
     """After a process finishes, its session is cleaned up from the manager."""
-    _, _, sid, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
     assert sid is not None
 
     # Interrupt the process
     manager.write_stdin(sid, chars="\x03", yield_time_ms=2_000)
 
     # A subsequent poll on the same session_id must report "unknown session"
-    out, _, sid2, _ = manager.write_stdin(sid, yield_time_ms=500)
+    out, _, sid2, _, _ = manager.write_stdin(sid, yield_time_ms=500)
     assert sid2 is None
     assert "completed or was never started" in out or str(sid) in out
 
@@ -275,7 +310,7 @@ def test_background_monitoring_pattern(manager):
       2. write_stdin (empty poll) in a loop until exit_code appears
     """
     # Command emits 3 lines spaced 0.3 s apart
-    out, _w, sid, ec = manager.exec_command(
+    out, _w, sid, ec, _ = manager.exec_command(
         "for i in 1 2 3; do echo step $i; sleep 0.3; done",
         yield_time_ms=500,
     )
@@ -287,7 +322,7 @@ def test_background_monitoring_pattern(manager):
 
     # Poll up to 10 times until the process finishes
     for _ in range(10):
-        out_p, _w_p, sid_p, ec_p = manager.write_stdin(
+        out_p, _w_p, sid_p, ec_p, _ = manager.write_stdin(
             sid, chars="", yield_time_ms=1_000
         )
         collected += out_p
@@ -304,18 +339,18 @@ def test_background_monitoring_pattern(manager):
 
 def test_multiple_concurrent_sessions(manager):
     """Multiple processes can run simultaneously and be polled independently."""
-    _, _, sid_a, _ = manager.exec_command("sleep 60", yield_time_ms=500)
-    _, _, sid_b, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid_a, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
+    _, _, sid_b, _, _ = manager.exec_command("sleep 60", yield_time_ms=500)
 
     assert sid_a is not None
     assert sid_b is not None
     assert sid_a != sid_b
 
     # Both sessions still alive
-    _, _, sid_pa, _ = manager.write_stdin(sid_a, yield_time_ms=5_000)
+    _, _, sid_pa, _, _ = manager.write_stdin(sid_a, yield_time_ms=5_000)
     assert sid_pa == sid_a
 
-    _, _, sid_pb, _ = manager.write_stdin(sid_b, yield_time_ms=5_000)
+    _, _, sid_pb, _, _ = manager.write_stdin(sid_b, yield_time_ms=5_000)
     assert sid_pb == sid_b
 
     # Clean up both
@@ -355,13 +390,14 @@ def test_observation_done_has_exit_code_not_session_id():
 
 
 def test_observation_original_token_count():
+    # The manager computes this pre-truncation and passes it as a parameter.
     obs = InteractiveTerminalObservation.create(
         output="x" * 400,
         wall_time_seconds=1.0,
         session_id=None,
         exit_code=0,
+        original_token_count=100,  # 400 chars / 4 ≈ 100 tokens
     )
-    # 400 chars / 4 ≈ 100 tokens
     assert obs.original_token_count == 100
 
 
