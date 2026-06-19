@@ -9,6 +9,7 @@ dependencies = [
   "alembic>=1.13",
   "docker>=7.1,<8",
   "fastapi>=0.104",
+  "joserfc>=1.0.0",
   "openhands-sdk",
   "openai>=2.33.0,<3",
   "pydantic>=2",

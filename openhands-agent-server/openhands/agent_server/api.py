@@ -41,6 +41,7 @@ from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.init_router import (
     InitService,
     init_router,
+    load_init_public_keys,
     require_initialized,
 )
 from openhands.agent_server.llm_router import llm_router
@@ -130,6 +131,10 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
         _cleanup_stale_tmux_sessions()
 
         config: Config = api.state.config
+        # Read the trusted init public keys once, at boot. A misconfigured key
+        # file (unreadable, or containing no usable keys) fails startup fast
+        # rather than silently rejecting every POST /api/init at runtime.
+        api.state.init_public_keys = load_init_public_keys(config)
         deferred = config.deferred_init
         vscode_service = get_vscode_service()
         desktop_service = get_desktop_service()
@@ -214,7 +219,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
         # In deferred-init mode the conversation service is *not* entered
         # here — that happens later, when POST /api/init delivers the runtime
         # config. We still mark the /ready endpoint as ready so a warm-pool
-        # orchestrator can tell the pod has finished booting and is
+        # orchestrator can tell the instance has finished booting and is
         # available to receive its /api/init payload.
         if deferred:
             init_service = InitService(api, base_config=config)

@@ -22,6 +22,10 @@ V1_SESSION_API_KEY_ENV = "OH_SESSION_API_KEYS_0"
 ENVIRONMENT_VARIABLE_PREFIX = "OH"
 CONFIG_PATH_ENV = "OPENHANDS_AGENT_SERVER_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path("workspace/openhands_agent_server_config.json")
+# Default name of the environment variable that an asymmetric init token's
+# expected ``aud`` is read from (see ``init_token_audience_env``). The
+# orchestrator sets this per instance; it is deployment-environment agnostic.
+DEFAULT_INIT_TOKEN_AUDIENCE_ENV = "AGENT_SERVER_NAME"
 _logger = logging.getLogger(__name__)
 
 
@@ -243,8 +247,58 @@ class Config(BaseModel):
             "(VSCode, tool preload, etc.) start as usual, but the conversation, "
             "event, and bash routers return 503 until POST /api/init is called with "
             "the runtime configuration. This is intended for warm-pool deployments "
-            "where pods are pre-warmed before a user is matched and per-user "
+            "where instances are pre-warmed before a user is matched and per-user "
             "configuration is delivered later."
+        ),
+    )
+    init_public_key_file: Path | None = Field(
+        default=None,
+        description=(
+            "Path to a PEM file containing the public key(s) trusted to "
+            "authenticate POST /api/init. When set, the init endpoint switches "
+            "to asymmetric auth: the caller (the orchestrator) must present an "
+            "ES256 JWT signed by the corresponding private key, sent as "
+            "'Authorization: Bearer <jwt>'. "
+            "This replaces the shared symmetric secret_key for init — the server "
+            "only holds the (non-secret) public key, so a compromised server "
+            "instance cannot forge init calls. The file may contain multiple "
+            "concatenated PEM blocks to support key rotation. When set, the "
+            "symmetric secret_key is NOT accepted for init (fail closed); "
+            "secret_key keeps its separate cipher role. Set via "
+            "OH_INIT_PUBLIC_KEY_FILE."
+        ),
+    )
+    init_token_audience: str | None = Field(
+        default=None,
+        description=(
+            "Expected 'aud' claim for asymmetric init tokens, as a literal "
+            "value. Takes precedence over init_token_audience_env. In "
+            "multi-instance deployments where each instance needs a distinct "
+            "audience, leave this unset and let it resolve from "
+            "init_token_audience_env instead. A resolved audience (this literal, "
+            "or the variable named by init_token_audience_env) is REQUIRED when "
+            "init_public_key_file is set: the server fails to boot if none "
+            "resolves. Set via OH_INIT_TOKEN_AUDIENCE."
+        ),
+    )
+    init_token_audience_env: str | None = Field(
+        default=DEFAULT_INIT_TOKEN_AUDIENCE_ENV,
+        description=(
+            "Name of an environment variable to read the expected 'aud' claim "
+            "from at startup. Defaults to 'AGENT_SERVER_NAME'. Lets an identical "
+            "deployment spec give each instance a distinct audience: the "
+            "orchestrator sets this one variable per instance while the spec "
+            "stays constant. Override to read from a different variable. Ignored "
+            "when init_token_audience (a literal) is set. Set via "
+            "OH_INIT_TOKEN_AUDIENCE_ENV."
+        ),
+    )
+    init_token_leeway_seconds: int = Field(
+        default=60,
+        ge=0,
+        description=(
+            "Clock-skew leeway, in seconds, applied when validating the 'exp' "
+            "and 'nbf' claims of asymmetric init tokens."
         ),
     )
     model_config: ClassVar[ConfigDict] = {"frozen": True}
