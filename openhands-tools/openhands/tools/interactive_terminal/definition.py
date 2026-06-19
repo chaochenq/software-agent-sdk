@@ -370,7 +370,7 @@ class WriteStdinTool(ToolDefinition[WriteStdinAction, InteractiveTerminalObserva
                 observation_type=InteractiveTerminalObservation,
                 annotations=ToolAnnotations(
                     readOnlyHint=False,
-                    destructiveHint=False,
+                    destructiveHint=True,
                     idempotentHint=False,
                     openWorldHint=False,
                 ),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from openhands.sdk.tool import ToolExecutor
@@ -17,6 +18,9 @@ if TYPE_CHECKING:
     from openhands.tools.interactive_terminal.impl import InteractiveTerminalManager
 
 
+_log = logging.getLogger(__name__)
+
+
 def _mask_output(output: str, conversation: LocalConversation | None) -> str:
     """Apply registered-secret masking to *output* if a conversation is available."""
     if not output or conversation is None:
@@ -27,6 +31,8 @@ def _mask_output(output: str, conversation: LocalConversation | None) -> str:
     except Exception:  # noqa: BLE001
         # Masking must never break tool execution — return raw output on any error
         # (e.g. malformed registry state, missing attribute on mock objects in tests).
+        # Log the failure so a buggy masker does not leak secrets silently.
+        _log.warning("Secret masking failed; returning unmasked output", exc_info=True)
         return output
 
 

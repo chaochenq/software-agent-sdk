@@ -2,10 +2,32 @@
 
 import threading
 import time
+from typing import NamedTuple
 from weakref import WeakValueDictionary
 
 from openhands.tools.terminal.definition import TerminalAction
 from openhands.tools.terminal.terminal import TerminalSession, create_terminal_session
+
+
+class TerminalResult(NamedTuple):
+    """Result of :meth:`InteractiveTerminalManager.exec_command` / ``write_stdin``.
+
+    Exactly one of ``session_id`` / ``exit_code`` is not ``None``:
+
+    * ``session_id`` is set when the process is **still running** — pass it to
+      ``write_stdin`` to poll or send input.
+    * ``exit_code`` is set when the process has **completed**.
+
+    Using a ``NamedTuple`` (instead of a bare tuple) makes the 3+ positional
+    unpack sites self-documenting and catches field reordering at definition
+    time, while remaining positionally unpackable for existing call sites.
+    """
+
+    output: str
+    wall_time_seconds: float
+    session_id: int | None
+    exit_code: int | None
+    original_token_count: int | None
 
 
 # Per-conversation manager cache.
@@ -87,17 +109,12 @@ class InteractiveTerminalManager:
         workdir: str | None = None,
         yield_time_ms: int = 10_000,
         max_output_tokens: int | None = None,
-    ) -> tuple[str, float, int | None, int | None, int | None]:
+    ) -> TerminalResult:
         """Start *cmd* in a new session and return after *yield_time_ms*.
 
-        Returns:
-            ``(output, wall_time_seconds, session_id, exit_code, original_token_count)``
-
-            Exactly one of ``session_id`` / ``exit_code`` is not ``None``:
-
-            * ``session_id`` is set when the process is **still running** —
-              pass it to ``write_stdin`` to poll or send input.
-            * ``exit_code`` is set when the process has **completed**.
+        Returns a :class:`TerminalResult` whose ``session_id`` is set when the
+        process is still running (pass it to ``write_stdin``) or whose
+        ``exit_code`` is set when the process has completed.
         """
         session = create_terminal_session(work_dir=workdir or self._work_dir)
         session.initialize()
@@ -121,12 +138,12 @@ class InteractiveTerminalManager:
         chars: str = "",
         yield_time_ms: int = 5_000,
         max_output_tokens: int | None = None,
-    ) -> tuple[str, float, int | None, int | None, int | None]:
+    ) -> TerminalResult:
         """Send *chars* to session *session_id* and return after *yield_time_ms*.
 
         Pass ``chars=""`` to poll for new output without writing anything.
 
-        Returns the same 5-tuple as :meth:`exec_command`.
+        Returns a :class:`TerminalResult` (same shape as :meth:`exec_command`).
         """
         with self._lock:
             session = self._sessions.get(session_id)
@@ -136,7 +153,7 @@ class InteractiveTerminalManager:
                 f"No running session with session_id={session_id}. "
                 "The process may have already completed or was never started."
             )
-            return msg, 0.0, None, None, None
+            return TerminalResult(msg, 0.0, None, None, None)
 
         is_empty_poll = chars == ""
         yield_s = _clamp_yield(yield_time_ms, is_empty_poll=is_empty_poll)
@@ -205,7 +222,7 @@ class InteractiveTerminalManager:
         session: TerminalSession,
         session_id: int,
         max_output_tokens: int | None,
-    ) -> tuple[str, float, int | None, int | None, int | None]:
+    ) -> TerminalResult:
         from openhands.tools.terminal.definition import TerminalObservation
 
         assert isinstance(obs, TerminalObservation)
@@ -230,7 +247,7 @@ class InteractiveTerminalManager:
             output = full_output
 
         if session.is_running():
-            return output, wall, session_id, None, original_token_count
+            return TerminalResult(output, wall, session_id, None, original_token_count)
 
         # Process finished — remove from the sessions map and close the session
         # so the underlying tmux pane / subprocess shell is torn down promptly.
@@ -256,4 +273,4 @@ class InteractiveTerminalManager:
         # metadata.exit_code is the real exit code when PS1 appeared, or -1
         # if the process was interrupted before the prompt could be captured.
         ec = obs.metadata.exit_code
-        return output, wall, None, ec, original_token_count
+        return TerminalResult(output, wall, None, ec, original_token_count)
