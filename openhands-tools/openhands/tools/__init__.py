@@ -20,6 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from openhands.tools.delegate import DelegationVisualizer
 from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.interactive_terminal import InteractiveTerminalToolSet
 from openhands.tools.preset.default import (
     get_default_agent,
     get_default_tools,
@@ -42,6 +43,7 @@ __all__ = [
     "__version__",
     "DelegationVisualizer",
     "FileEditorTool",
+    "InteractiveTerminalToolSet",
     "TaskToolSet",
     "TaskTrackerTool",
     "TerminalTool",
