@@ -211,18 +211,41 @@ class InteractiveTerminalManager:
         assert isinstance(obs, TerminalObservation)
         full_output = obs.text or ""
         # Compute token count BEFORE truncation so original_token_count is accurate.
-        original_token_count = len(full_output) // _CHARS_PER_TOKEN or None
-        output = (
-            full_output[: max_output_tokens * _CHARS_PER_TOKEN]
-            if max_output_tokens is not None
-            else full_output
+        # Guard with ``if full_output`` so a real (short) output yielding 0 is kept
+        # distinct from "no output at all" (None).
+        original_token_count = (
+            len(full_output) // _CHARS_PER_TOKEN if full_output else None
         )
+        if max_output_tokens is not None:
+            # Truncate by UTF-8 bytes, then decode with errors="ignore" so a
+            # multi-byte sequence straddling the boundary is dropped cleanly
+            # instead of producing invalid UTF-8 (which would break JSON
+            # serialization of the observation event). This also keeps the
+            # byte budget closer to the real token count for non-ASCII output
+            # (CJK / emoji), where 1 char ≈ 3-4 bytes rather than 4 chars/token.
+            output = full_output.encode("utf-8", errors="ignore")[
+                : max_output_tokens * _CHARS_PER_TOKEN
+            ].decode("utf-8", errors="ignore")
+        else:
+            output = full_output
 
         if session.is_running():
             return output, wall, session_id, None, original_token_count
 
         # Process finished — remove from the sessions map and close the session
         # so the underlying tmux pane / subprocess shell is torn down promptly.
+        #
+        # Concurrency note: another thread that already grabbed ``session`` from
+        # ``_sessions`` (line 131-132) and released the lock may still be inside
+        # ``session.execute()`` when we reach ``close()``. Holding the manager
+        # lock across ``close()`` would NOT prevent that — the other thread is
+        # not holding it during ``execute()``. The terminal backend has its own
+        # internal locking; the practical risk is low because agents call tools
+        # sequentially. We pop under the lock (so no NEW callers can find this
+        # session) and tolerate a best-effort close. A fully race-free teardown
+        # would require per-session synchronization between execute() and close()
+        # at the TerminalSession level, which is out of scope for this additive
+        # toolset.
         with self._lock:
             self._sessions.pop(session_id, None)
         try:

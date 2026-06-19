@@ -202,8 +202,14 @@ class InteractiveTerminalObservation(Observation):
             text.append("Session not found", style="dim")
         if self.output:
             text.append("\n")
-            text.append(self.output[:500])
-            if len(self.output) > 500:
+            # Truncate by UTF-8 bytes so a multi-byte sequence at the boundary
+            # is dropped cleanly rather than split (display-only, but keep it
+            # consistent with the byte-safe truncation used for the LLM payload).
+            preview = self.output.encode("utf-8", errors="ignore")[:500].decode(
+                "utf-8", errors="ignore"
+            )
+            text.append(preview)
+            if len(self.output.encode("utf-8", errors="ignore")) > 500:
                 text.append("…", style="dim")
         return text
 
@@ -309,7 +315,8 @@ class ExecCommandTool(
         """Create an ExecCommandTool.
 
         Pass *manager* to share a process manager with a ``WriteStdinTool``; omit
-        it (or use :class:`InteractiveTerminalToolSet`) to get a fresh manager.
+        it (or use :class:`InteractiveTerminalToolSet`) to get the shared
+        per-conversation manager.
         """
         from openhands.tools.interactive_terminal.executor import ExecCommandExecutor
         from openhands.tools.interactive_terminal.impl import get_or_create_manager
@@ -346,7 +353,8 @@ class WriteStdinTool(ToolDefinition[WriteStdinAction, InteractiveTerminalObserva
         """Create a WriteStdinTool.
 
         Pass *manager* to share a process manager with an ``ExecCommandTool``; omit
-        it (or use :class:`InteractiveTerminalToolSet`) to get a fresh manager.
+        it (or use :class:`InteractiveTerminalToolSet`) to get the shared
+        per-conversation manager.
         """
         from openhands.tools.interactive_terminal.executor import WriteStdinExecutor
         from openhands.tools.interactive_terminal.impl import get_or_create_manager

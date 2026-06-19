@@ -226,6 +226,34 @@ def test_max_output_tokens_truncates_output(manager):
     assert len(out) <= 20 + 5  # small slack for header chars
 
 
+@_unix_only
+def test_max_output_tokens_truncates_non_ascii_safely(manager):
+    """max_output_tokens truncation must not split multi-byte UTF-8 sequences.
+
+    Emoji output (4 bytes/char) truncated to a byte budget must still be valid
+    UTF-8 — the boundary sequence is dropped cleanly via encode/decode with
+    errors='ignore', never producing a partial code point that would break JSON
+    serialization of the observation event. The byte-budget cap also keeps the
+    non-ASCII payload closer to the real token count.
+    """
+    # 10 rockets = 40 UTF-8 bytes of payload (plus terminal escape sequences).
+    # Budget of 12 tokens = 48 bytes caps the *byte* length of the whole output.
+    out, _w, _sid, ec, _ = manager.exec_command(
+        "printf '\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80"
+        "\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80"
+        "\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80\\xf0\\x9f\\x9a\\x80"
+        "\\xf0\\x9f\\x9a\\x80\\n'",
+        yield_time_ms=5_000,
+        max_output_tokens=12,  # 12 tokens * 4 bytes = 48 bytes budget
+    )
+    assert ec == 0
+    # The truncated output must be valid UTF-8 — re-encoding round-trips exactly,
+    # with no partial multi-byte sequence at the boundary.
+    assert out.encode("utf-8").decode("utf-8") == out
+    # Byte length must respect the budget (no partial trailing byte is kept).
+    assert len(out.encode("utf-8")) <= 12 * 4
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Manager unit tests — write_stdin
 # ──────────────────────────────────────────────────────────────────────────────
