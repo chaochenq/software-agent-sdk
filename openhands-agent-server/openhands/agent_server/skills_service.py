@@ -26,6 +26,9 @@ from pydantic import BaseModel, ValidationError
 
 from openhands.sdk.logger import get_logger
 from openhands.sdk.marketplace import Marketplace
+from openhands.sdk.marketplace.registration import MarketplaceRegistration
+from openhands.sdk.marketplace.registry import MarketplaceRegistry
+from openhands.sdk.plugin import Plugin
 from openhands.sdk.skills import (
     InstalledSkillInfo,
     Skill,
@@ -290,6 +293,45 @@ def merge_skills(skill_lists: list[list[Skill]]) -> list[Skill]:
     return list(skills_by_name.values())
 
 
+def load_registered_marketplace_skills(
+    registered_marketplaces: list[MarketplaceRegistration],
+) -> list[Skill]:
+    """Load skills from auto-load plugins in registered marketplaces."""
+    if not registered_marketplaces:
+        return []
+
+    registry = MarketplaceRegistry(registered_marketplaces)
+    all_skills: list[Skill] = []
+    for registration in registry.get_auto_load_registrations():
+        try:
+            marketplace, _ = registry.get_marketplace(registration.name)
+        except Exception:
+            logger.warning(
+                "Failed to load marketplace '%s'; continuing without it",
+                registration.name,
+                exc_info=True,
+            )
+            continue
+
+        for entry in marketplace.plugins:
+            try:
+                source, ref, repo_path = marketplace.resolve_plugin_source(entry)
+                plugin_path = Plugin.fetch(
+                    source=source,
+                    ref=ref,
+                    repo_path=repo_path,
+                )
+                all_skills.extend(Plugin.load(plugin_path).get_all_skills())
+            except Exception:
+                logger.warning(
+                    "Failed to load plugin '%s' from marketplace '%s'",
+                    entry.name,
+                    registration.name,
+                    exc_info=True,
+                )
+    return all_skills
+
+
 def load_all_skills(
     load_public: bool = True,
     load_user: bool = True,
@@ -299,6 +341,7 @@ def load_all_skills(
     org_repos: list[tuple[str, str]] | None = None,
     sandbox_exposed_urls: list[ExposedUrlData] | None = None,
     marketplace_path: str | None = DEFAULT_MARKETPLACE_PATH,
+    registered_marketplaces: list[MarketplaceRegistration] | None = None,
 ) -> SkillLoadResult:
     """Load and merge skills from all configured sources.
 
@@ -321,6 +364,8 @@ def load_all_skills(
         sandbox_exposed_urls: List of exposed URLs from sandbox.
         marketplace_path: Relative marketplace JSON path for public skills.
             Pass None to load all public skills without marketplace filtering.
+        registered_marketplaces: Marketplace registrations whose auto-load plugins
+            replace legacy public skills when provided.
 
     Returns:
         SkillLoadResult containing merged skills and source counts.
@@ -337,12 +382,20 @@ def load_all_skills(
     sources["sandbox"] = len(sandbox_skills)
     skill_lists.append(sandbox_skills)
 
-    # 2-3. Load public + user skills via helper (no project yet — org sits between)
+    marketplace_skills: list[Skill] = []
+    if load_public and registered_marketplaces:
+        marketplace_skills = load_registered_marketplace_skills(registered_marketplaces)
+    sources["registered_marketplaces"] = len(marketplace_skills)
+    skill_lists.append(marketplace_skills)
+
+    # 2-3. Load legacy public + user skills via helper (no project yet — org sits
+    # between). Registered marketplaces replace legacy public skills, while user
+    # skills keep their existing precedence above the public marketplace tier.
     sdk_base = load_available_skills(
         work_dir=None,
         include_user=load_user,
         include_project=False,
-        include_public=load_public,
+        include_public=load_public and not registered_marketplaces,
         marketplace_path=marketplace_path,
     )
     sources["sdk_base"] = len(sdk_base)
