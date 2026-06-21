@@ -212,7 +212,7 @@ class AskOracleTool(ToolDefinition[AskOracleAction, AskOracleObservation]):
                     readOnlyHint=True,
                     destructiveHint=False,
                     idempotentHint=False,
-                    openWorldHint=False,
+                    openWorldHint=True,
                 ),
             )
         ]

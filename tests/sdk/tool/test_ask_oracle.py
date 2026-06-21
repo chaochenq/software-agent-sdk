@@ -87,6 +87,8 @@ def test_ask_oracle_tool_description_guides_second_opinion_usage() -> None:
 
     assert "Ask the Oracle for a second opinion" in tool.description
     assert "Treat the Oracle's response as strong guidance" in tool.description
+    assert tool.annotations is not None
+    assert tool.annotations.openWorldHint
 
 
 def test_ask_oracle_tool_validates_profile_name() -> None:

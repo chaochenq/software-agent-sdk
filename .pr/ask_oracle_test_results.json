@@ -5,7 +5,7 @@
     "warnings": 5
   },
   "example_pytest": {
-    "command": "uv run pytest tests/examples/test_examples.py --run-examples -k 54_ask_oracle_tool",
+    "command": "uv run pytest tests/examples/test_examples.py --run-examples -k 55_ask_oracle_tool",
     "result": "1 passed, 64 deselected",
     "warnings": 5
   },
