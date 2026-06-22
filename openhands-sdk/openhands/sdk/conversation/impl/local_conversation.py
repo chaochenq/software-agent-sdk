@@ -54,6 +54,7 @@ from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.llm.llm_registry import LLMRegistry
 from openhands.sdk.logger import get_logger
 from openhands.sdk.marketplace.registry import MarketplaceRegistry
+from openhands.sdk.mcp import create_mcp_tools
 from openhands.sdk.observability.laminar import observe
 from openhands.sdk.plugin import (
     Plugin,
@@ -76,6 +77,8 @@ from openhands.sdk.subagent import (
     register_file_agents,
     register_plugin_agents,
 )
+from openhands.sdk.tool import ToolDefinition
+from openhands.sdk.tool.builtins import InvokeSkillTool
 from openhands.sdk.tool.client_tool import ClientToolSpec
 from openhands.sdk.tool.schema import Action, Observation
 from openhands.sdk.utils.cipher import Cipher
@@ -87,6 +90,8 @@ logger = get_logger(__name__)
 ACP_LAST_PROMPT_USER_MESSAGE_ID = "acp_last_prompt_user_message_id"
 ACP_INFLIGHT_PROMPT_USER_MESSAGE_ID = "acp_inflight_prompt_user_message_id"
 ACP_SUPERSEDE_INFLIGHT_PROMPT = "acp_supersede_inflight_prompt"
+_RUNTIME_MCP_TIMEOUT_SECS = 30
+
 ACP_STOP_HOOK_FEEDBACK_PREFIX = "[Stop hook feedback]"
 
 
@@ -735,7 +740,7 @@ class LocalConversation(BaseConversation):
                 # Load the plugin
                 plugin = Plugin.load(path)
                 logger.debug(
-                    f"Loaded plugin '{plugin.manifest.name}' from {spec.source}"
+                    f"Loaded plugin '{plugin.manifest.name}'"
                     + (f" @ {resolved_ref[:8]}" if resolved_ref else "")
                 )
 
@@ -915,6 +920,10 @@ class LocalConversation(BaseConversation):
             if self._state.persistence_dir is not None
             else None
         )
+        previous_processor = self._hook_processor
+        if previous_processor is not None:
+            previous_processor.run_session_end()
+
         self._state.hook_config = merged_config
         self._pending_hook_config = merged_config
         self._hook_processor, self._on_event = create_hook_callback(
@@ -928,6 +937,28 @@ class LocalConversation(BaseConversation):
             conversation_stats=self._state.stats,
         )
         self._hook_processor.set_conversation_state(self._state)
+        self._hook_processor.run_session_start()
+
+    def _runtime_tools_for_plugin(
+        self, plugin_mcp_config: dict[str, Any] | None
+    ) -> list[ToolDefinition]:
+        runtime_tools: list[ToolDefinition] = []
+        if plugin_mcp_config:
+            runtime_tools.extend(
+                create_mcp_tools(plugin_mcp_config, _RUNTIME_MCP_TIMEOUT_SECS).tools
+            )
+
+        agent_context = self.agent.agent_context
+        has_invocable_skills = bool(
+            agent_context
+            and any(
+                skill.is_agentskills_format and not skill.disable_model_invocation
+                for skill in agent_context.skills
+            )
+        )
+        if has_invocable_skills and InvokeSkillTool.name not in self.agent.tools_map:
+            runtime_tools.extend(InvokeSkillTool.create(self._state))
+        return runtime_tools
 
     def load_plugin(self, plugin_ref: str) -> None:
         """Load a plugin from the conversation's registered marketplaces."""
@@ -943,10 +974,21 @@ class LocalConversation(BaseConversation):
         )
         plugin = Plugin.load(path)
         logger.info(
-            f"Loaded plugin '{plugin.manifest.name}' from {spec.source}"
+            f"Loaded plugin '{plugin.manifest.name}'"
             + (f" @ {resolved_ref[:8]}" if resolved_ref else "")
         )
 
+        get_secret = self._state.secret_registry.get_secret_value
+        runtime_plugin_mcp = (
+            expand_mcp_variables(
+                plugin.mcp_config,
+                {},
+                get_secret=get_secret,
+                expand_defaults=True,
+            )
+            if plugin.mcp_config
+            else None
+        )
         merged_context = plugin.add_skills_to(self.agent.agent_context)
         merged_mcp = plugin.add_mcp_config_to(
             dict(self.agent.mcp_config) if self.agent.mcp_config else {}
@@ -955,35 +997,36 @@ class LocalConversation(BaseConversation):
             merged_mcp = expand_mcp_variables(
                 merged_mcp,
                 {},
-                get_secret=self._state.secret_registry.get_secret_value,
+                get_secret=get_secret,
                 expand_defaults=True,
             )
 
-        self.agent = self.agent.model_copy(
-            update={
-                "agent_context": merged_context,
-                "mcp_config": merged_mcp,
-            }
-        )
-
-        if plugin.agents:
-            register_plugin_agents(
-                agents=plugin.agents,
-                work_dir=self.workspace.working_dir,
-            )
-        if plugin.hooks and not plugin.hooks.is_empty():
-            self._merge_runtime_plugin_hooks(plugin.hooks)
-
-        resolved = ResolvedPluginSource.from_plugin_source(spec, resolved_ref)
-        if self._resolved_plugins is None:
-            self._resolved_plugins = []
-        self._resolved_plugins.append(resolved)
-
         with self._state:
+            self.agent = self.agent.model_copy(
+                update={
+                    "agent_context": merged_context,
+                    "mcp_config": merged_mcp,
+                }
+            )
+
+            if plugin.agents:
+                register_plugin_agents(
+                    agents=plugin.agents,
+                    work_dir=self.workspace.working_dir,
+                )
+            if plugin.hooks and not plugin.hooks.is_empty():
+                self._merge_runtime_plugin_hooks(plugin.hooks)
+
+            resolved = ResolvedPluginSource.from_plugin_source(spec, resolved_ref)
+            if self._resolved_plugins is None:
+                self._resolved_plugins = []
+            self._resolved_plugins.append(resolved)
+
             self._state.agent = self.agent
             if self._agent_ready:
-                self.agent.reset_runtime_tools()
-                self.agent.init_state(self._state, on_event=self._on_event)
+                self.agent.add_runtime_tools(
+                    self._runtime_tools_for_plugin(runtime_plugin_mcp)
+                )
 
     def _register_file_based_agents(self) -> None:
         """Discover and register file-based agents into the agent registry.
