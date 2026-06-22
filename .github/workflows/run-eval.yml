@@ -21,6 +21,7 @@ on:
                     - swtbench
                     - commit0
                     - swebenchmultimodal
+                    - harbor
                     - terminalbench
                     - programbench
             sdk_ref:
@@ -76,6 +77,11 @@ on:
                 description: Extensions repo branch to use (for testing feature branches with skills/plugins)
                 required: false
                 default: main
+                type: string
+            harbor_config_json:
+                description: JSON config for Harbor mode (target, target_type, adapter_repo, adapter_ref, adapter_path, agent, agent_env, agent_kwargs, extra_args)
+                required: false
+                default: ''
                 type: string
             instance_ids:
                 description: >-
@@ -177,6 +183,7 @@ jobs:
                   TOOL_PRESET: ${{ github.event.inputs.tool_preset || 'default' }}
                   AGENT_TYPE: ${{ github.event.inputs.agent_type || 'default' }}
                   PARTIAL_ARCHIVE_URL: ${{ github.event.inputs.partial_archive_url || 'N/A' }}
+                  HARBOR_CONFIG_JSON: ${{ github.event.inputs.harbor_config_json || 'N/A' }}
                   LABEL_NAME: ${{ github.event.label.name || 'N/A' }}
               run: |
                   echo "=== Workflow Parameters ==="
@@ -202,6 +209,7 @@ jobs:
                   echo "tool_preset: $TOOL_PRESET"
                   echo "agent_type: $AGENT_TYPE"
                   echo "partial_archive_url: $PARTIAL_ARCHIVE_URL"
+                  echo "harbor_config_json: $HARBOR_CONFIG_JSON"
                   echo ""
                   echo "=== Environment Variables ==="
                   echo "EVAL_REPO: $EVAL_REPO"
@@ -413,6 +421,7 @@ jobs:
                   TOOL_PRESET: ${{ github.event.inputs.tool_preset || 'default' }}
                   AGENT_TYPE: ${{ github.event.inputs.agent_type || 'default' }}
                   PARTIAL_ARCHIVE_URL: ${{ github.event.inputs.partial_archive_url || '' }}
+                  HARBOR_CONFIG_JSON: ${{ github.event.inputs.harbor_config_json || '' }}
                   TRIGGERED_BY: ${{ github.actor }}
               run: |
                   # Normalize instance_ids: strip all spaces
@@ -438,8 +447,9 @@ jobs:
                     --arg tool_preset "$TOOL_PRESET" \
                     --arg agent_type "$AGENT_TYPE" \
                     --arg partial_archive_url "$PARTIAL_ARCHIVE_URL" \
+                    --arg harbor_config_json "$HARBOR_CONFIG_JSON" \
                     --arg triggered_by "$TRIGGERED_BY" \
-                    '{ref: $ref, inputs: {sdk_commit: $sdk, sdk_workflow_run_id: $sdk_run_id, eval_limit: $eval_limit, models_json: ($models | tostring), trigger_reason: $reason, pr_number: $pr, benchmarks_branch: $benchmarks, extensions_branch: $extensions, benchmark: $benchmark, instance_ids: $instance_ids, num_infer_workers: $num_infer_workers, num_eval_workers: $num_eval_workers, enable_conversation_event_logging: $enable_conversation_event_logging, max_retries: $max_retries, tool_preset: $tool_preset, agent_type: $agent_type, partial_archive_url: $partial_archive_url, triggered_by: $triggered_by}}')
+                    '{ref: $ref, inputs: {sdk_commit: $sdk, sdk_workflow_run_id: $sdk_run_id, eval_limit: $eval_limit, models_json: ($models | tostring), trigger_reason: $reason, pr_number: $pr, benchmarks_branch: $benchmarks, extensions_branch: $extensions, benchmark: $benchmark, harbor_config_json: $harbor_config_json, instance_ids: $instance_ids, num_infer_workers: $num_infer_workers, num_eval_workers: $num_eval_workers, enable_conversation_event_logging: $enable_conversation_event_logging, max_retries: $max_retries, tool_preset: $tool_preset, agent_type: $agent_type, partial_archive_url: $partial_archive_url, triggered_by: $triggered_by}}')
                   RESPONSE=$(curl -sS -o /tmp/dispatch.out -w "%{http_code}" -X POST \
                     -H "Authorization: token $DISPATCH_TOKEN" \
                     -H "Accept: application/vnd.github+json" \
