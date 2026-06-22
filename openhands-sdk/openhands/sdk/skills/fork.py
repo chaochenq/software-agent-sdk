@@ -16,13 +16,12 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.skills.execute import render_content_with_commands
 
 
-# Skill names are not guaranteed to be filesystem-safe:
-# - Legacy skills derive their name from a relative path, which can contain
-#   "/" (e.g. "subdir/my_skill") and would create unintended nested dirs.
-# - Programmatic Skill(name=...) has no name validator; a crafted name like
-#   "../../etc/passwd" would escape the forks directory.
-# AgentSkills-format skills ARE validated (lowercase [a-z0-9-]) but we
-# sanitize unconditionally to keep the fork persistence layout predictable.
+# Skill names are not guaranteed to be filesystem-safe. This is only a
+# persistence-layout normalization step: it keeps legacy names such as
+# "subdir/my_skill" from creating nested fork directories, and keeps
+# programmatic names from being interpreted as path components. It is not a
+# trust boundary for skill loading or inline command execution; skill sources
+# still need to be trusted by the caller.
 _UNSAFE_PATH_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
 
