@@ -306,6 +306,35 @@ class TestLoadAllSkills:
 
         assert {skill.name for skill in skills} == {"auto-skill", "manual-skill"}
 
+    def test_load_registered_marketplace_skills_uses_registration_fetch_fields(
+        self, tmp_path: Path
+    ):
+        """Marketplace source, ref, and repo_path drive registry fetching."""
+        marketplace_dir = _create_test_marketplace(tmp_path / "marketplace")
+
+        with patch(
+            "openhands.sdk.marketplace.registry.fetch_plugin_with_resolution",
+            return_value=(marketplace_dir, "abc123"),
+        ) as mock_fetch:
+            skills = load_registered_marketplace_skills(
+                [
+                    MarketplaceRegistration(
+                        name="custom",
+                        source="github:example/marketplaces",
+                        ref="feature-branch",
+                        repo_path="catalogs/public",
+                        auto_load="all",
+                    )
+                ]
+            )
+
+        assert {skill.name for skill in skills} == {"auto-skill", "manual-skill"}
+        mock_fetch.assert_called_once_with(
+            source="github:example/marketplaces",
+            ref="feature-branch",
+            repo_path="catalogs/public",
+        )
+
     def test_load_all_skills_returns_skill_load_result(self):
         """Test that load_all_skills returns a SkillLoadResult."""
         with patch(self._PATCH_TARGET, return_value={}):
