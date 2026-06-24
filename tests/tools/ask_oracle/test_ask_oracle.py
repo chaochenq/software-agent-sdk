@@ -3,9 +3,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pydantic import PrivateAttr, ValidationError
+from pydantic import PrivateAttr
 
-from openhands.sdk import LLM, LocalConversation, OpenHandsAgentSettings, Tool
+from openhands.sdk import LLM, LocalConversation, Tool
 from openhands.sdk.agent import Agent
 from openhands.sdk.llm import (
     LLMResponse,
@@ -17,7 +17,8 @@ from openhands.sdk.llm import (
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.tool import ToolDefinition
-from openhands.sdk.tool.builtins import (
+from openhands.tools.ask_oracle import (
+    ORACLE_PROFILE_NAME,
     AskOracleAction,
     AskOracleObservation,
     AskOracleTool,
@@ -69,13 +70,11 @@ def _message_text(message: Message) -> str:
     )
 
 
-def _make_conversation(profile_name: str = "oracle") -> LocalConversation:
+def _make_conversation() -> LocalConversation:
     return LocalConversation(
         agent=Agent(
             llm=_make_llm("default-model", "default"),
-            tools=[
-                Tool(name=AskOracleTool.name, params={"profile_name": profile_name})
-            ],
+            tools=[Tool(name=AskOracleTool.name)],
             include_default_tools=[],
         ),
         workspace=Path.cwd(),
@@ -83,7 +82,7 @@ def _make_conversation(profile_name: str = "oracle") -> LocalConversation:
 
 
 def test_ask_oracle_tool_description_guides_second_opinion_usage() -> None:
-    tool = AskOracleTool.create(profile_name="oracle")[0]
+    tool = AskOracleTool.create()[0]
 
     assert "Ask the Oracle for a second opinion" in tool.description
     assert "Treat the Oracle's response as strong guidance" in tool.description
@@ -91,65 +90,20 @@ def test_ask_oracle_tool_description_guides_second_opinion_usage() -> None:
     assert tool.annotations.openWorldHint
 
 
-def test_ask_oracle_tool_validates_profile_name() -> None:
-    with pytest.raises(ValueError, match="Invalid Oracle profile name"):
-        AskOracleTool.create(profile_name="../oracle")
+def test_ask_oracle_tool_rejects_parameters() -> None:
+    with pytest.raises(ValueError, match="does not accept parameters"):
+        AskOracleTool.create(profile_name="custom")
 
 
-def test_agent_settings_adds_ask_oracle_tool_when_profile_is_configured() -> None:
-    agent = OpenHandsAgentSettings(
+def test_ask_oracle_tool_added_by_name() -> None:
+    agent = Agent(
         llm=_make_llm("default-model", "default"),
-        oracle_llm_profile="oracle",
-    ).create_agent()
-
-    assert any(
-        tool.name == AskOracleTool.name and tool.params == {"profile_name": "oracle"}
-        for tool in agent.tools
+        tools=[Tool(name=AskOracleTool.name)],
+        include_default_tools=[],
     )
-
     conversation = LocalConversation(agent=agent, workspace=Path.cwd())
     conversation._ensure_agent_ready()
     assert "ask_oracle" in agent.tools_map
-
-
-def test_agent_settings_configured_profile_updates_existing_ask_oracle_tool() -> None:
-    agent = OpenHandsAgentSettings(
-        llm=_make_llm("default-model", "default"),
-        oracle_llm_profile="oracle",
-        tools=[
-            Tool(
-                name=AskOracleTool.name,
-                params={
-                    "profile_name": "stale",
-                    "profile_store_dir": "/tmp/profiles",
-                },
-            )
-        ],
-    ).create_agent()
-
-    oracle_tools = [tool for tool in agent.tools if tool.name == AskOracleTool.name]
-    assert len(oracle_tools) == 1
-    assert oracle_tools[0].params == {
-        "profile_name": "oracle",
-        "profile_store_dir": "/tmp/profiles",
-    }
-
-
-def test_agent_settings_omits_ask_oracle_tool_without_profile() -> None:
-    agent = OpenHandsAgentSettings(
-        llm=_make_llm("default-model", "default"),
-    ).create_agent()
-
-    assert all(tool.name != AskOracleTool.name for tool in agent.tools)
-
-    conversation = LocalConversation(agent=agent, workspace=Path.cwd())
-    conversation._ensure_agent_ready()
-    assert "ask_oracle" not in agent.tools_map
-
-
-def test_agent_settings_rejects_invalid_oracle_profile_name() -> None:
-    with pytest.raises(ValidationError, match="oracle_llm_profile"):
-        OpenHandsAgentSettings(oracle_llm_profile="../oracle")
 
 
 def test_ask_oracle_tool_returns_oracle_recommendation(
@@ -170,7 +124,7 @@ def test_ask_oracle_tool_returns_oracle_recommendation(
         *,
         cipher=None,
     ) -> LLM:
-        assert name == "oracle"
+        assert name == ORACLE_PROFILE_NAME
         return oracle_llm
 
     monkeypatch.setattr(LLMProfileStore, "load", load_profile)
@@ -209,7 +163,7 @@ def test_ask_oracle_tool_reports_missing_profile(
     profile_dir.mkdir()
 
     monkeypatch.setattr(llm_profile_store, "_DEFAULT_PROFILE_DIR", profile_dir)
-    conversation = _make_conversation(profile_name="missing")
+    conversation = _make_conversation()
 
     observation = conversation.execute_tool(
         "ask_oracle",
@@ -220,6 +174,7 @@ def test_ask_oracle_tool_reports_missing_profile(
     assert observation.is_error
     assert observation.response == ""
     assert "not available" in observation.text
+    assert ORACLE_PROFILE_NAME in observation.text
 
 
 def test_ask_oracle_tool_reports_empty_oracle_response(

@@ -9,13 +9,14 @@ from pydantic import SecretStr
 
 from openhands.sdk import (
     LLM,
+    Agent,
     LLMProfileStore,
     LocalConversation,
-    OpenHandsAgentSettings,
+    Tool,
 )
 from openhands.sdk.agent.utils import make_llm_completion
 from openhands.sdk.llm import Message, TextContent, llm_profile_store
-from openhands.sdk.tool.builtins import AskOracleAction
+from openhands.tools.ask_oracle import ORACLE_PROFILE_NAME, AskOracleAction
 
 
 RESULT_PATH = Path(__file__).with_name("ask_oracle_live_validation.json")
@@ -67,14 +68,11 @@ try:
     primary_text = first_text(primary_response.message)
 
     store = LLMProfileStore()
-    store.save("oracle", oracle_llm, include_secrets=True)
+    store.save(ORACLE_PROFILE_NAME, oracle_llm, include_secrets=True)
 
-    settings = OpenHandsAgentSettings(
-        llm=primary_llm,
-        oracle_llm_profile="oracle",
-        enable_switch_llm_tool=False,
-    )
-    agent = settings.create_agent()
+    # The ask_oracle tool is added by name and resolves the conventional
+    # "oracle" profile at run time; no agent setting or wiring is required.
+    agent = Agent(llm=primary_llm, tools=[Tool(name="ask_oracle")])
     conversation = LocalConversation(agent=agent, workspace=Path.cwd())
     conversation._ensure_agent_ready()
     observation = conversation.execute_tool(

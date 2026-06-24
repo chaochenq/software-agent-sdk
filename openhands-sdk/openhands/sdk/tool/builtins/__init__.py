@@ -6,12 +6,6 @@ also includes optional SDK tools that are resolved by name from agent setup.
 Tools that require interacting with the environment belong in `openhands-tools`.
 """
 
-from openhands.sdk.tool.builtins.ask_oracle import (
-    AskOracleAction,
-    AskOracleExecutor,
-    AskOracleObservation,
-    AskOracleTool,
-)
 from openhands.sdk.tool.builtins.finish import (
     FinishAction,
     FinishExecutor,
@@ -48,7 +42,6 @@ BUILT_IN_TOOLS = [FinishTool, ThinkTool]
 # conditional wiring in `Agent._initialize`.
 BUILT_IN_TOOL_CLASSES = {
     **{tool.__name__: tool for tool in BUILT_IN_TOOLS},
-    AskOracleTool.__name__: AskOracleTool,
     InvokeSkillTool.__name__: InvokeSkillTool,
     SwitchLLMTool.__name__: SwitchLLMTool,
 }
@@ -56,10 +49,6 @@ BUILT_IN_TOOL_CLASSES = {
 __all__ = [
     "BUILT_IN_TOOLS",
     "BUILT_IN_TOOL_CLASSES",
-    "AskOracleTool",
-    "AskOracleAction",
-    "AskOracleObservation",
-    "AskOracleExecutor",
     "FinishTool",
     "FinishAction",
     "FinishObservation",

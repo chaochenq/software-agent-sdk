@@ -1,4 +1,8 @@
-"""Example: configure an Oracle LLM profile for the ask_oracle tool.
+"""Example: consult the Oracle via the ask_oracle tool.
+
+The Oracle is a saved LLM profile resolved by convention under the name
+``oracle``. Save such a profile, then add ``Tool(name="ask_oracle")`` to the
+agent — no agent setting or wiring is required.
 
 Set `OPENAI_API_KEY` for the primary OpenAI profile and `LITELLM_API_KEY` for
 the eval proxy Oracle profile before running live. Optional overrides:
@@ -17,12 +21,13 @@ from pydantic import SecretStr
 
 from openhands.sdk import (
     LLM,
+    Agent,
     LLMProfileStore,
     LocalConversation,
-    OpenHandsAgentSettings,
+    Tool,
 )
 from openhands.sdk.llm import llm_profile_store
-from openhands.sdk.tool.builtins import AskOracleAction
+from openhands.tools.ask_oracle import ORACLE_PROFILE_NAME, AskOracleAction
 
 
 primary_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
@@ -57,9 +62,10 @@ oracle_llm = LLM(
 )
 
 try:
-    store.save("oracle", oracle_llm, include_secrets=True)
-    settings = OpenHandsAgentSettings(llm=primary_llm, oracle_llm_profile="oracle")
-    agent = settings.create_agent()
+    # Save the Oracle model under the conventional profile name.
+    store.save(ORACLE_PROFILE_NAME, oracle_llm, include_secrets=True)
+
+    agent = Agent(llm=primary_llm, tools=[Tool(name="ask_oracle")])
     conversation = LocalConversation(agent=agent, workspace=Path.cwd())
     conversation._ensure_agent_ready()
 

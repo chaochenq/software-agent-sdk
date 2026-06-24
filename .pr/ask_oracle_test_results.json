@@ -1,13 +1,11 @@
 {
   "targeted_pytest": {
-    "command": "uv run pytest tests/sdk/tool/test_ask_oracle.py tests/sdk/tool/test_builtins.py tests/sdk/test_settings.py::test_llm_agent_settings_export_schema_groups_sections tests/sdk/test_settings.py::test_export_agent_settings_schema_emits_variant_tagged_sections tests/examples/test_examples.py::test_directory_example_is_discovered",
-    "result": "12 passed",
-    "warnings": 5
+    "command": "uv run pytest tests/tools/ask_oracle/test_ask_oracle.py tests/sdk/tool/test_builtins.py tests/sdk/test_settings.py::test_llm_agent_settings_export_schema_groups_sections tests/sdk/test_settings.py::test_export_agent_settings_schema_emits_variant_tagged_sections tests/examples/test_examples.py::test_directory_example_is_discovered",
+    "result": "10 passed"
   },
   "example_pytest": {
     "command": "uv run pytest tests/examples/test_examples.py --run-examples -k 55_ask_oracle_tool",
-    "result": "1 passed, 64 deselected",
-    "warnings": 5
+    "result": "1 passed, 66 deselected"
   },
   "pre_commit": {
     "command": "uv run pre-commit run --files <changed ask_oracle files>",
