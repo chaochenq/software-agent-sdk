@@ -693,6 +693,28 @@ def test_git_delta_captures_modifications_and_untracked_vs_head(client, tmp_path
     assert "changed" in patch
 
 
+def test_git_delta_excludes_node_modules_even_when_not_gitignored(client, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(["init"], root)
+    # New source file (should be in the delta) + a heavy untracked node_modules
+    # with NO .gitignore (should be excluded by the default excludes).
+    (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "big.js").write_text(
+        "// huge\n" * 100, encoding="utf-8"
+    )
+
+    resp = client.get(
+        "/api/file/archive", params={"path": str(root), "format": "git-delta"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    patch = resp.content.decode("utf-8")
+    assert "app.py" in patch
+    assert "node_modules" not in patch
+
+
 def test_git_delta_on_non_repo_returns_400(client, workspace):
     resp = client.get(
         "/api/file/archive", params={"path": str(workspace), "format": "git-delta"}

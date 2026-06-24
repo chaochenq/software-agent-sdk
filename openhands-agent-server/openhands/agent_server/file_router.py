@@ -232,23 +232,49 @@ def _create_zip_archive(
         raise
 
 
+# Heavy / generated directories that bloat a delta without helping eval replay.
+# Applied via a scratch ``core.excludesFile`` so they are skipped even when the
+# repo itself does not ``.gitignore`` them (the repo's own .gitignore still
+# applies on top of this).
+_GIT_DELTA_DEFAULT_EXCLUDES = (
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    "dist/",
+    "build/",
+    ".next/",
+    "target/",
+    "*.pyc",
+)
+
+
 def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> None:
-    """Write a git patch capturing the full working-tree delta against a base.
+    """Write a git patch capturing the working-tree delta against a base.
 
     The delta covers tracked modifications, new (untracked) files, and
     deletions relative to ``base_ref`` (defaulting to the auto-detected
     comparison ref — origin branch, merge-base, or the empty tree for a fresh
     repo). A throwaway index (``GIT_INDEX_FILE``) is used so the repository's
-    real index is never touched.
+    real index is never touched. Heavy generated/dependency directories
+    (``_GIT_DELTA_DEFAULT_EXCLUDES``, e.g. ``node_modules/``) are excluded —
+    on top of the repo's own ``.gitignore`` — so the delta stays compact for
+    eval replay even if such a directory is present but not git-ignored.
     """
     validate_git_repository(root)
     ref = get_valid_ref(root, base_ref) or GIT_EMPTY_TREE_HASH
     index_path = output_path.with_name(output_path.name + ".index")
+    excludes_path = output_path.with_name(output_path.name + ".excludes")
+    excludes_path.write_text("\n".join(_GIT_DELTA_DEFAULT_EXCLUDES) + "\n")
     env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
     try:
-        # Seed the scratch index from the base ref, stage the entire working
-        # tree on top of it, then diff: the result is everything that changed
-        # between the base and the workspace's current state.
+        # Seed the scratch index from the base ref, stage the working tree on
+        # top of it (skipping the default excludes), then diff: the result is
+        # everything that changed between the base and the workspace's current
+        # state.
         subprocess.run(
             ["git", "read-tree", ref],
             cwd=root,
@@ -258,7 +284,7 @@ def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> No
             timeout=60,
         )
         subprocess.run(
-            ["git", "add", "-A"],
+            ["git", "-c", f"core.excludesFile={excludes_path}", "add", "-A"],
             cwd=root,
             env=env,
             capture_output=True,
@@ -288,6 +314,7 @@ def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> No
         raise
     finally:
         index_path.unlink(missing_ok=True)
+        excludes_path.unlink(missing_ok=True)
 
 
 def _build_workspace_archive(
