@@ -715,6 +715,53 @@ def test_git_delta_excludes_node_modules_even_when_not_gitignored(client, tmp_pa
     assert "node_modules" not in patch
 
 
+def test_git_delta_scoped_to_requested_subdirectory(client, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(["init"], root)
+    (root / "outside.txt").write_text("base\n", encoding="utf-8")
+    sub = root / "sub"
+    sub.mkdir()
+    (sub / "inside.txt").write_text("base\n", encoding="utf-8")
+    _git(["add", "-A"], root)
+    _git(["commit", "-m", "init"], root)
+    # Change a file inside the subdir AND one outside it, after the commit.
+    (root / "outside.txt").write_text("changed-outside\n", encoding="utf-8")
+    (sub / "inside.txt").write_text("changed-inside\n", encoding="utf-8")
+
+    # Archiving the subdir must yield only the subdir's delta, not the repo's.
+    resp = client.get(
+        "/api/file/archive",
+        params={"path": str(sub), "format": "git-delta", "base_ref": "HEAD"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    patch = resp.content.decode("utf-8")
+    assert "inside.txt" in patch
+    assert "outside.txt" not in patch
+
+
+def test_git_delta_invalid_base_ref_returns_400(client, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(["init"], root)
+    (root / "a.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], root)
+    _git(["commit", "-m", "init"], root)
+
+    resp = client.get(
+        "/api/file/archive",
+        params={
+            "path": str(root),
+            "format": "git-delta",
+            "base_ref": "does-not-exist-ref",
+        },
+    )
+
+    # A bad base_ref is client error, not a 500.
+    assert resp.status_code == 400
+
+
 def test_git_delta_on_non_repo_returns_400(client, workspace):
     resp = client.get(
         "/api/file/archive", params={"path": str(workspace), "format": "git-delta"}

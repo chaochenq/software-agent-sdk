@@ -265,16 +265,22 @@ def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> No
     eval replay even if such a directory is present but not git-ignored.
     """
     validate_git_repository(root)
-    ref = get_valid_ref(root, base_ref) or GIT_EMPTY_TREE_HASH
+    try:
+        ref = get_valid_ref(root, base_ref) or GIT_EMPTY_TREE_HASH
+    except GitCommandError as e:
+        # An explicit base_ref that does not resolve is client error, not a
+        # server fault; surface it so the caller gets a 4xx.
+        raise ValueError(f"base_ref {base_ref!r} could not be resolved") from e
     index_path = output_path.with_name(output_path.name + ".index")
     excludes_path = output_path.with_name(output_path.name + ".excludes")
     excludes_path.write_text("\n".join(_GIT_DELTA_DEFAULT_EXCLUDES) + "\n")
     env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
     try:
         # Seed the scratch index from the base ref, stage the working tree on
-        # top of it (skipping the default excludes), then diff: the result is
-        # everything that changed between the base and the workspace's current
-        # state.
+        # top of it (skipping the default excludes), then diff. The ``-- .``
+        # pathspec scopes staging and the diff to the requested directory, so a
+        # ``path`` that is a subdirectory of a larger repo yields only that
+        # subtree's delta rather than the whole repository's.
         subprocess.run(
             ["git", "read-tree", ref],
             cwd=root,
@@ -284,7 +290,7 @@ def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> No
             timeout=60,
         )
         subprocess.run(
-            ["git", "-c", f"core.excludesFile={excludes_path}", "add", "-A"],
+            ["git", "-c", f"core.excludesFile={excludes_path}", "add", "-A", "--", "."],
             cwd=root,
             env=env,
             capture_output=True,
@@ -292,7 +298,7 @@ def _create_git_delta(root: Path, base_ref: str | None, output_path: Path) -> No
             timeout=300,
         )
         result = subprocess.run(
-            ["git", "diff", "--binary", "--cached", ref],
+            ["git", "diff", "--binary", "--cached", ref, "--", "."],
             cwd=root,
             env=env,
             capture_output=True,
@@ -604,6 +610,12 @@ async def archive_directory(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Not a git repository: {e}",
+        )
+    except ValueError as e:
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
         )
     except GitCommandError as e:
         output_path.unlink(missing_ok=True)
