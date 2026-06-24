@@ -140,6 +140,13 @@ class OpenHandsAgentProfile(AgentProfileBase):
         default=False,
         description="Enable sub-agent delegation via TaskToolSet.",
     )
+    enable_switch_llm_tool: bool = Field(
+        default=True,
+        description=(
+            "Enable the built-in switch_llm tool for switching between saved "
+            "LLM profiles."
+        ),
+    )
     tool_concurrency_limit: int = Field(
         default=1,
         ge=1,

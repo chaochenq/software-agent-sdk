@@ -40,6 +40,7 @@ def test_openhands_profile_round_trips() -> None:
         mcp_server_refs=["fetch"],
         system_message_suffix="be terse",
         enable_sub_agents=True,
+        enable_switch_llm_tool=False,
         tool_concurrency_limit=4,
     )
     reloaded = validate_agent_profile(profile.model_dump(mode="json"))
@@ -51,7 +52,13 @@ def test_openhands_profile_round_trips() -> None:
     assert reloaded.llm_profile_ref == "default"
     assert reloaded.revision == 3
     assert reloaded.mcp_server_refs == ["fetch"]
+    assert reloaded.enable_switch_llm_tool is False
     assert reloaded.tool_concurrency_limit == 4
+
+
+def test_openhands_profile_defaults_enable_switch_llm_tool_true() -> None:
+    profile = OpenHandsAgentProfile(name="oh", llm_profile_ref="default")
+    assert profile.enable_switch_llm_tool is True
 
 
 def test_acp_profile_round_trips() -> None:

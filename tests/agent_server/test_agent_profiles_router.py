@@ -496,6 +496,7 @@ def test_seed_preserves_openhands_fields(client):
         json={
             "agent_settings_diff": {
                 "enable_sub_agents": True,
+                "enable_switch_llm_tool": False,
                 "tool_concurrency_limit": 3,
                 "agent_context": {"system_message_suffix": "be terse"},
                 "verification": {
@@ -509,6 +510,7 @@ def test_seed_preserves_openhands_fields(client):
 
     prof = client.get("/api/agent-profiles/default").json()["profile"]
     assert prof["enable_sub_agents"] is True
+    assert prof["enable_switch_llm_tool"] is False
     assert prof["tool_concurrency_limit"] == 3
     assert prof["system_message_suffix"] == "be terse"
     assert prof["verification"]["critic_enabled"] is True

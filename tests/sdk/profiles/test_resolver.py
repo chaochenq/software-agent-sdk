@@ -72,6 +72,7 @@ def test_openhands_resolves_to_settings_with_injected_llm(
         agent="CodeActAgent",
         system_message_suffix="be terse",
         enable_sub_agents=True,
+        enable_switch_llm_tool=False,
         tool_concurrency_limit=3,
         mcp_server_refs=["fetch"],
     )
@@ -82,6 +83,7 @@ def test_openhands_resolves_to_settings_with_injected_llm(
     assert isinstance(settings, OpenHandsAgentSettings)
     assert settings.agent == "CodeActAgent"
     assert settings.enable_sub_agents is True
+    assert settings.enable_switch_llm_tool is False
     assert settings.tool_concurrency_limit == 3
     assert settings.agent_context is not None
     assert settings.agent_context.system_message_suffix == "be terse"

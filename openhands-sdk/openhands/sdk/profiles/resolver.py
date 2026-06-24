@@ -222,6 +222,7 @@ def _build_openhands_settings(
         "condenser": profile.condenser,
         "verification": profile.verification.model_dump(),
         "enable_sub_agents": profile.enable_sub_agents,
+        "enable_switch_llm_tool": profile.enable_switch_llm_tool,
         "tool_concurrency_limit": profile.tool_concurrency_limit,
     }
     return validate_agent_settings(payload)

@@ -235,6 +235,7 @@ def _build_seed_profile(
         condenser=agent_settings.condenser,
         verification=_profile_verification(agent_settings.verification),
         enable_sub_agents=agent_settings.enable_sub_agents,
+        enable_switch_llm_tool=agent_settings.enable_switch_llm_tool,
         tool_concurrency_limit=agent_settings.tool_concurrency_limit,
         mcp_server_refs=None,
     )
