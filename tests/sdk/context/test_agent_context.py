@@ -1123,3 +1123,14 @@ def test_agent_context_secrets_static_secret_still_masked():
     assert "static-secret" not in context.model_dump_json()
     exposed = context.model_dump(context={"expose_secrets": True})
     assert exposed["secrets"]["TOKEN"]["value"] == "static-secret"
+
+
+def test_load_user_plugins_defaults_false_and_is_settable():
+    """load_user_plugins mirrors load_user_skills: opt-in, default False."""
+    assert AgentContext().load_user_plugins is False
+    assert AgentContext(load_user_plugins=True).load_user_plugins is True
+    # Round-trips through serialization like the other plugin/skill flags.
+    restored = AgentContext.model_validate(
+        AgentContext(load_user_plugins=True).model_dump()
+    )
+    assert restored.load_user_plugins is True

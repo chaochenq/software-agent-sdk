@@ -120,6 +120,18 @@ class AgentContext(BaseModel):
         ),
         json_schema_extra={"acp_compatible": True},
     )
+    load_user_plugins: bool = Field(
+        default=False,
+        description=(
+            "Whether to automatically load user-installed plugins from "
+            "~/.openhands/plugins/installed/ (managed via install_plugin / "
+            "uninstall_plugin) at conversation startup. This mirrors "
+            "load_user_skills for plugins: like load_project_skills, the flag is "
+            "resolved by LocalConversation on the first run()/send_message() "
+            "rather than by AgentContext itself."
+        ),
+        json_schema_extra={"acp_compatible": True},
+    )
     load_project_skills: bool = Field(
         default=False,
         description=(

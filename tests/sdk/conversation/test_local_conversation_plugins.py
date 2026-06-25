@@ -14,7 +14,11 @@ from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.hooks import HookConfig
 from openhands.sdk.hooks.config import HookDefinition, HookMatcher
 from openhands.sdk.marketplace import MarketplaceRegistration
-from openhands.sdk.plugin import PluginSource
+from openhands.sdk.plugin import (
+    PluginSource,
+    install_plugin,
+    load_installed_plugins as real_load_installed_plugins,
+)
 from openhands.sdk.tool.builtins import ThinkTool
 
 
@@ -1353,5 +1357,129 @@ class TestPluginSourceSecretExpansion:
             conversation._ensure_plugins_loaded()
 
         assert captured["ref"] == "v1.2.3"
+
+        conversation.close()
+
+
+class TestLocalConversationUserPlugins:
+    """Tests for auto-loading user-installed plugins.
+
+    Mirrors AgentContext.load_user_skills, but for plugins installed under
+    ~/.openhands/plugins/installed/ (managed via install_plugin). The default
+    installed dir is monkeypatched to a temp dir so tests stay hermetic.
+    """
+
+    def _install_test_plugin(
+        self,
+        tmp_path: Path,
+        installed_dir: Path,
+        name: str,
+        skill_name: str,
+    ) -> None:
+        plugin_src = create_test_plugin(
+            tmp_path / f"src-{name}",
+            name=name,
+            skills=[{"name": skill_name, "content": f"{skill_name} content"}],
+        )
+        install_plugin(source=str(plugin_src), installed_dir=installed_dir)
+
+    def test_load_user_plugins_loads_installed_plugins(
+        self, tmp_path: Path, mock_llm, monkeypatch
+    ):
+        """load_user_plugins=True merges installed plugins' skills at startup."""
+        installed_dir = tmp_path / "installed"
+        installed_dir.mkdir()
+        self._install_test_plugin(tmp_path, installed_dir, "user-plugin", "user-skill")
+
+        monkeypatch.setattr(
+            local_conversation_impl,
+            "load_installed_plugins",
+            lambda: real_load_installed_plugins(installed_dir=installed_dir),
+        )
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(load_user_plugins=True),
+        )
+        conversation = LocalConversation(
+            agent=agent,
+            workspace=workspace,
+            visualizer=None,
+        )
+        conversation._ensure_plugins_loaded()
+
+        assert conversation.agent.agent_context is not None
+        skill_names = [s.name for s in conversation.agent.agent_context.skills]
+        assert "user-skill" in skill_names
+        # Installed plugins are local and version-pinned on disk, so they are not
+        # tracked as resolved remote sources for deterministic resume.
+        assert not conversation.resolved_plugins
+
+        conversation.close()
+
+    def test_load_user_plugins_disabled_by_default(
+        self, tmp_path: Path, mock_llm, monkeypatch
+    ):
+        """With the default (False), installed plugins are not even queried."""
+        installed_dir = tmp_path / "installed"
+        installed_dir.mkdir()
+        self._install_test_plugin(tmp_path, installed_dir, "user-plugin", "user-skill")
+
+        calls = {"n": 0}
+
+        def _tracking_loader():
+            calls["n"] += 1
+            return real_load_installed_plugins(installed_dir=installed_dir)
+
+        monkeypatch.setattr(
+            local_conversation_impl, "load_installed_plugins", _tracking_loader
+        )
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(llm=mock_llm, tools=[], agent_context=AgentContext())
+        conversation = LocalConversation(
+            agent=agent,
+            workspace=workspace,
+            visualizer=None,
+        )
+        conversation._ensure_plugins_loaded()
+
+        assert calls["n"] == 0
+        context = conversation.agent.agent_context
+        skill_names = [s.name for s in context.skills] if context else []
+        assert "user-skill" not in skill_names
+
+        conversation.close()
+
+    def test_load_user_plugins_best_effort_on_loader_error(
+        self, tmp_path: Path, mock_llm, monkeypatch
+    ):
+        """A failing installed-plugin load must not block conversation startup."""
+
+        def _boom():
+            raise RuntimeError("installed plugins unreadable")
+
+        monkeypatch.setattr(local_conversation_impl, "load_installed_plugins", _boom)
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = Agent(
+            llm=mock_llm,
+            tools=[],
+            agent_context=AgentContext(load_user_plugins=True),
+        )
+        conversation = LocalConversation(
+            agent=agent,
+            workspace=workspace,
+            visualizer=None,
+        )
+
+        # Should not raise despite the loader error.
+        conversation._ensure_plugins_loaded()
+        assert conversation._plugins_loaded is True
 
         conversation.close()

@@ -61,6 +61,7 @@ from openhands.sdk.plugin import (
     PluginSource,
     ResolvedPluginSource,
     fetch_plugin_with_resolution,
+    load_installed_plugins,
 )
 from openhands.sdk.secret import StaticSecret
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -669,6 +670,17 @@ class LocalConversation(BaseConversation):
         # Track whether we have plugins or MCP config to process
         has_mcp_config = bool(merged_mcp)
 
+        def _merge_loaded_plugin(plugin: Plugin) -> None:
+            """Merge a loaded plugin's skills, MCP config, hooks, and agents."""
+            nonlocal merged_context, merged_mcp, has_mcp_config
+            merged_context = plugin.add_skills_to(merged_context)
+            merged_mcp = plugin.add_mcp_config_to(merged_mcp)
+            has_mcp_config = has_mcp_config or bool(merged_mcp)
+            if plugin.hooks and not plugin.hooks.is_empty():
+                all_plugin_hooks.append(plugin.hooks)
+            if plugin.agents:
+                all_plugin_agents.extend(plugin.agents)
+
         plugins_to_load: list[tuple[PluginSource, bool]] = []
         if merged_context is not None and merged_context.registered_marketplaces:
             registrations = [
@@ -745,19 +757,43 @@ class LocalConversation(BaseConversation):
                 )
 
                 # Merge plugin contents
-                merged_context = plugin.add_skills_to(merged_context)
-                merged_mcp = plugin.add_mcp_config_to(merged_mcp)
-                has_mcp_config = has_mcp_config or bool(merged_mcp)
-
-                # Collect hooks
-                if plugin.hooks and not plugin.hooks.is_empty():
-                    all_plugin_hooks.append(plugin.hooks)
-
-                # Collect agent definitions
-                if plugin.agents:
-                    all_plugin_agents.extend(plugin.agents)
+                _merge_loaded_plugin(plugin)
 
             logger.info(f"Loaded {len(plugins_to_load)} plugin(s) via Conversation")
+
+        # Auto-load user-installed plugins from ~/.openhands/plugins/installed/
+        # (parity with AgentContext.load_user_skills). These plugins are already
+        # on disk and version-pinned by install_plugin, so they are loaded
+        # directly rather than fetched, and are not added to _resolved_plugins.
+        # Best-effort: a failure to load/merge an installed plugin must not
+        # prevent the conversation from starting.
+        user_plugins_loaded = False
+        if merged_context is not None and merged_context.load_user_plugins:
+            try:
+                installed_plugins = load_installed_plugins()
+            except Exception:
+                logger.warning(
+                    "Failed to load user-installed plugins; continuing without them",
+                    exc_info=True,
+                )
+                installed_plugins = []
+            for plugin in installed_plugins:
+                try:
+                    _merge_loaded_plugin(plugin)
+                except Exception:
+                    logger.warning(
+                        "Failed to merge installed plugin '%s'; skipping",
+                        getattr(plugin, "name", "<unknown>"),
+                        exc_info=True,
+                    )
+                    continue
+                user_plugins_loaded = True
+            if installed_plugins:
+                logger.info(
+                    "Loaded %d user-installed plugin(s) from "
+                    "~/.openhands/plugins/installed/",
+                    len(installed_plugins),
+                )
 
         # Resolve project skills from the workspace. AgentContext can't do this
         # itself (the workspace path is unknown at validation time), so it is done
@@ -810,7 +846,12 @@ class LocalConversation(BaseConversation):
 
         # Update agent with merged content only if something changed.
         # Skip update otherwise to avoid unnecessary agent state mutations.
-        if plugins_to_load or has_mcp_config or project_skills_loaded:
+        if (
+            plugins_to_load
+            or has_mcp_config
+            or project_skills_loaded
+            or user_plugins_loaded
+        ):
             self.agent = self.agent.model_copy(
                 update={
                     "agent_context": merged_context,
