@@ -9,32 +9,43 @@ This directory is temporary PR evidence for the `ask_oracle` tool implementation
 - Removed the previous `OpenHandsAgentSettings.oracle_llm_profile` field and the `AskOracleTool` SDK built-in (and its `BUILT_IN_TOOL_CLASSES` entry). The SDK no longer references the tool at all, so there is no `openhands-sdk` → `openhands-tools` dependency.
 - The active conversation LLM is not switched. The Oracle call sends only the Oracle system prompt plus the agent's question and optional context, without forwarding conversation history or tools.
 
-## Live validation
+## Live validation (end-to-end)
 
 Evidence file: `.pr/ask_oracle_live_validation.json`
+
+This drives the **real agent loop** — not a unit-level
+`conversation.execute_tool()` call. The agent itself decides to call
+`ask_oracle`, the tool consults the `oracle` profile, and the agent answers
+using the Oracle's response.
 
 Command run:
 
 ```bash
 OPENHANDS_SUPPRESS_BANNER=1 \
-OPENAI_API_KEY="$OPENAI_API_KEY" \
-LITELLM_API_KEY="$LITELLM_API_KEY" \
+LLM_API_KEY=... LLM_BASE_URL=https://llm-proxy.eval.all-hands.dev \
+ASK_ORACLE_PRIMARY_MODEL=litellm_proxy/openai/gpt-5.1 \
+ASK_ORACLE_MODEL=litellm_proxy/openai/gpt-5-mini \
 uv run python .pr/ask_oracle_live_validation.py
 ```
 
-Validated profiles:
+Profiles:
 
-- Regular profile: `openai/gpt-5-nano` with OpenAI direct API key.
-- Oracle profile: `litellm_proxy/openai/gpt-5-mini` with the eval LiteLLM key.
-- Eval proxy base URL: `https://llm-proxy.eval.all-hands.dev`, found in `openhands-sdk/openhands/sdk/agent/base.py`.
+- Primary: `litellm_proxy/openai/gpt-5.1` (the agent's own model).
+- Oracle: `litellm_proxy/openai/gpt-5-mini`, saved under the conventional profile
+  name `oracle`, with `log_completions` enabled so its response can be read
+  independently.
 
-Result summary:
+Result summary (from the JSON):
 
-- Primary direct OpenAI profile returned: `primary profile live check ok`.
-- `ask_oracle` loaded the saved `oracle` profile from an isolated temporary profile store.
-- Tool observation was successful (`observation_is_error: false`).
-- Oracle response identified itself as the Oracle profile and explained why an agent should ask for a second opinion when stuck.
-- The temporary profile store was removed in a `finally` block after the run.
+- `agent_called_ask_oracle: true` — the agent emitted an `ask_oracle` action in
+  the loop (the question it asked the Oracle is recorded).
+- `ask_oracle_observation_in_loop: true`, `observation_is_error: false`.
+- **`oracle_logged_response_matches_observation: true`** — the Oracle's response
+  read straight from its own completion log (telemetry) matches the observation
+  the agent acted on, proving the answer came from the `oracle` profile.
+- `final_agent_answer` is the two-word reply (e.g. "Mostly mild") and
+  `conversation_finished: finished` — the conversation completed normally.
+- Temporary profile store and Oracle log dir are removed in a `finally` block.
 
 ## Validation commands
 

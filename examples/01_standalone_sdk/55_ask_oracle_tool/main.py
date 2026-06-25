@@ -1,88 +1,77 @@
-"""Example: consult the Oracle via the ask_oracle tool.
+"""Consult the Oracle end-to-end with the ask_oracle tool.
 
 The Oracle is a saved LLM profile resolved by convention under the name
-``oracle``. Save such a profile, then add ``Tool(name="ask_oracle")`` to the
-agent — no agent setting or wiring is required.
+``oracle``. This example wires two profiles — the agent's primary model and a
+separate ``oracle`` model — adds ``Tool(name="ask_oracle")`` to the agent, then
+drives a normal conversation: the agent decides to call ``ask_oracle``, the tool
+consults the ``oracle`` profile, and the agent uses the Oracle's answer to reply.
 
-Set `OPENAI_API_KEY` for the primary OpenAI profile and `LITELLM_API_KEY` for
-the eval proxy Oracle profile before running live. Optional overrides:
-
-    ASK_ORACLE_PRIMARY_MODEL=openai/gpt-5-nano
-    ASK_ORACLE_MODEL=litellm_proxy/openai/gpt-5-mini
-    ASK_ORACLE_BASE_URL=https://llm-proxy.eval.all-hands.dev
+Usage:
+    LLM_API_KEY=... LLM_BASE_URL=https://llm-proxy.app.all-hands.dev \
+        uv run python examples/01_standalone_sdk/55_ask_oracle_tool/main.py
 """
 
 import os
-import shutil
-import tempfile
-from pathlib import Path
 
 from pydantic import SecretStr
 
-from openhands.sdk import (
-    LLM,
-    Agent,
-    LLMProfileStore,
-    LocalConversation,
-    Tool,
+from openhands.sdk import LLM, Agent, LocalConversation, Tool
+from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+from openhands.tools.ask_oracle import ORACLE_PROFILE_NAME
+
+
+PRIMARY_PROFILE = "example-primary"
+DEFAULT_BASE_URL = "https://llm-proxy.app.all-hands.dev"
+# The agent's primary model (follows the standard LLM_MODEL env like other
+# examples). The Oracle defaults to the same model; override ASK_ORACLE_MODEL to
+# point the "oracle" profile at a different/stronger model.
+PRIMARY_MODEL = os.getenv("ASK_ORACLE_PRIMARY_MODEL") or os.getenv(
+    "LLM_MODEL", "openai/gpt-5.5"
 )
-from openhands.sdk.llm import llm_profile_store
-from openhands.tools.ask_oracle import ORACLE_PROFILE_NAME, AskOracleAction
+ORACLE_MODEL = os.getenv("ASK_ORACLE_MODEL", PRIMARY_MODEL)
 
+api_key = os.getenv("LLM_API_KEY")
+assert api_key is not None, "LLM_API_KEY environment variable is not set."
+base_url = os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)
 
-primary_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
-oracle_api_key = os.getenv("LITELLM_API_KEY") or os.getenv("LLM_API_KEY")
-
-if not primary_api_key or not oracle_api_key:
-    print(
-        "Set OPENAI_API_KEY (or LLM_API_KEY) and LITELLM_API_KEY "
-        "to run the live ask_oracle example."
-    )
-    print("EXAMPLE_COST: 0")
-    raise SystemExit(0)
-
-profile_store_dir = Path(tempfile.mkdtemp()) / "profiles"
-setattr(llm_profile_store, "_DEFAULT_PROFILE_DIR", profile_store_dir)
 store = LLMProfileStore()
-
-primary_llm = LLM(
-    model=os.getenv("ASK_ORACLE_PRIMARY_MODEL", "openai/gpt-5-nano"),
-    api_key=SecretStr(primary_api_key),
-    usage_id="ask-oracle-example-primary",
-    max_output_tokens=1000,
-    reasoning_effort="low",
+store.save(
+    PRIMARY_PROFILE,
+    LLM(
+        model=PRIMARY_MODEL,
+        api_key=SecretStr(api_key),
+        base_url=base_url,
+        usage_id="primary",
+    ),
+    include_secrets=True,
 )
-oracle_llm = LLM(
-    model=os.getenv("ASK_ORACLE_MODEL", "litellm_proxy/openai/gpt-5-mini"),
-    api_key=SecretStr(oracle_api_key),
-    base_url=os.getenv("ASK_ORACLE_BASE_URL", "https://llm-proxy.eval.all-hands.dev"),
-    usage_id="ask-oracle-example-oracle",
-    max_output_tokens=1000,
-    reasoning_effort="low",
+# The Oracle model is saved under the conventional profile name "oracle".
+store.save(
+    ORACLE_PROFILE_NAME,
+    LLM(
+        model=ORACLE_MODEL,
+        api_key=SecretStr(api_key),
+        base_url=base_url,
+        usage_id="oracle",
+    ),
+    include_secrets=True,
 )
 
 try:
-    # Save the Oracle model under the conventional profile name.
-    store.save(ORACLE_PROFILE_NAME, oracle_llm, include_secrets=True)
+    agent = Agent(llm=store.load(PRIMARY_PROFILE), tools=[Tool(name="ask_oracle")])
+    conversation = LocalConversation(agent=agent, workspace=os.getcwd())
 
-    agent = Agent(llm=primary_llm, tools=[Tool(name="ask_oracle")])
-    conversation = LocalConversation(agent=agent, workspace=Path.cwd())
-    conversation._ensure_agent_ready()
-
-    print(f"Configured tools: {sorted(agent.tools_map)}")
-    observation = conversation.execute_tool(
-        "ask_oracle",
-        AskOracleAction(
-            question=(
-                "In one sentence, recommend whether a feature flag should be stored "
-                "as one nullable setting or as a separate boolean plus string."
-            ),
-            context="Prefer the simplest backwards-compatible SDK settings design.",
-        ),
+    print(f"Primary model: {conversation.agent.llm.model}")
+    print(f"Oracle model:  {ORACLE_MODEL}")
+    conversation.send_message(
+        "Call the oracle to ask it for its opinion on the weather today, "
+        "then just tell me in two words how it's like."
     )
+    conversation.run()
 
-    print("Oracle said:")
-    print(observation.text)
-    print("EXAMPLE_COST: 0")
+    combined = conversation.state.stats.get_combined_metrics()
+    print(f"Total cost: ${combined.accumulated_cost:.6f}")
+    print(f"EXAMPLE_COST: {combined.accumulated_cost}")
 finally:
-    shutil.rmtree(profile_store_dir.parent, ignore_errors=True)
+    store.delete(PRIMARY_PROFILE)
+    store.delete(ORACLE_PROFILE_NAME)
