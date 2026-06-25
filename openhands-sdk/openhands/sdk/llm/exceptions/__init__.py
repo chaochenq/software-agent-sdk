@@ -1,6 +1,5 @@
 from .classifier import (
     is_context_window_exceeded,
-    is_prompt_cache_too_small,
     looks_like_auth_error,
     looks_like_malformed_conversation_history_error,
 )
@@ -49,7 +48,6 @@ __all__ = [
     "OperationCancelled",
     # Helpers
     "is_context_window_exceeded",
-    "is_prompt_cache_too_small",
     "looks_like_auth_error",
     "looks_like_malformed_conversation_history_error",
     "map_provider_exception",
