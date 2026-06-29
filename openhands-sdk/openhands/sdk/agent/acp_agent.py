@@ -3039,6 +3039,30 @@ class ACPAgent(AgentBase):
     def _prompt_response_was_cancelled(response: PromptResponse | None) -> bool:
         return response is not None and response.stop_reason == "cancelled"
 
+    # Exfiltration signatures checked on external ACP response text (MT-PA-001).
+    # Conservative, structural patterns — credentials embedded in URLs, common
+    # token/key shapes — not a content classifier.
+    _ACP_EXFIL_PATTERNS = (
+        re.compile(r"https?://[^\s/]*:[^\s/@]+@"),  # credentials in URL authority
+        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),  # GitHub token shapes
+        re.compile(r"\b(?:sk|rk)-[A-Za-z0-9]{20,}\b"),  # API secret-key shapes
+        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),  # private key blocks
+    )
+
+    def _validate_acp_response_text(self, response_text: str) -> str:
+        """Return ``response_text`` unless it carries exfiltration signatures, in
+        which case log the attempt and return a safe placeholder (MT-PA-001)."""
+        for pattern in self._ACP_EXFIL_PATTERNS:
+            if pattern.search(response_text):
+                logger.warning(
+                    "ACP response text matched an exfiltration pattern (%s); "
+                    "replacing with a safe message before emitting FinishAction.",
+                    pattern.pattern,
+                )
+                return "(Response withheld: failed output validation.)"
+        return response_text
+
     def _finalize_successful_turn(
         self,
         response: PromptResponse | None,
@@ -3077,6 +3101,14 @@ class ACPAgent(AgentBase):
         thought_text = mask("".join(self._client.accumulated_thoughts))
         if not response_text:
             response_text = "(No response from ACP server)"
+
+        # MT-PA-001: validate the (already-masked) external ACP response against
+        # exfiltration patterns before it lands in the persisted event stream and
+        # the terminal FinishAction. A malicious/compromised ACP server can return
+        # content that masking misses (e.g. attacker-shaped credential strings);
+        # this replaces a suspicious response with a safe error rather than
+        # emitting it downstream.
+        response_text = self._validate_acp_response_text(response_text)
 
         # ACP step() boundaries are full remote assistant turns, not
         # partial planning steps. Emit FinishAction to delimit that
