@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-ACP-server validation policy (MT-PA-001). Enforced in both the response-text path (ACPAgent._validate_acp_response_text) and the tool-call path (_OpenHandsACPBridge._validate_acp_tool_call). Loaded by _load_acp_validation_policy(); falls back to the built-in default per key.",
+  "allowed_tool_kinds": ["read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other"],
+  "blocklisted_content_patterns": [
+    "https?://[^\\s/]*:[^\\s/@]+@",
+    "\\bgh[pousr]_[A-Za-z0-9]{20,}\\b",
+    "\\b(?:sk|rk)-[A-Za-z0-9]{20,}\\b",
+    "\\bAKIA[0-9A-Z]{16}\\b",
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+  ]
+}

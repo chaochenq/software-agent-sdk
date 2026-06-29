@@ -95,6 +95,60 @@ logger = get_logger(__name__)
 maybe_init_laminar()
 
 
+# ── ACP response/tool-call validation policy (MT-PA-001) ──────────────────────
+# Single source of truth enforced in BOTH the response-text path
+# (``ACPAgent._validate_acp_response_text``) and the tool-call path
+# (``_OpenHandsACPBridge._validate_acp_tool_call``). Loaded once from the
+# well-known per-ACP-server policy file when present, else the built-in default.
+_DEFAULT_ACP_VALIDATION_POLICY: dict[str, Any] = {
+    "allowed_tool_kinds": [
+        "read",
+        "edit",
+        "delete",
+        "move",
+        "search",
+        "execute",
+        "think",
+        "fetch",
+        "switch_mode",
+        "other",
+    ],
+    "blocklisted_content_patterns": [
+        r"https?://[^\s/]*:[^\s/@]+@",  # credentials in URL authority
+        r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",  # GitHub token shapes
+        r"\b(?:sk|rk)-[A-Za-z0-9]{20,}\b",  # API secret-key shapes
+        r"\bAKIA[0-9A-Z]{16}\b",  # AWS access key id
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",  # private key blocks
+    ],
+}
+_ACP_VALIDATION_POLICY_FILENAME = ".openhands/acp-response-validation-policy.json"
+
+
+def _load_acp_validation_policy() -> dict[str, Any]:
+    """Load the ACP validation policy from the well-known JSON file when present,
+    else the built-in default. Malformed / partial files fall back per key so a
+    bad policy can never disable validation or break agent start-up."""
+    policy = {k: list(v) for k, v in _DEFAULT_ACP_VALIDATION_POLICY.items()}
+    try:
+        path = Path(_ACP_VALIDATION_POLICY_FILENAME)
+        if path.is_file():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key in ("allowed_tool_kinds", "blocklisted_content_patterns"):
+                    if isinstance(loaded.get(key), list):
+                        policy[key] = loaded[key]
+    except Exception:  # noqa: BLE001 — never let a bad policy file break the agent
+        logger.warning("Failed to load ACP validation policy; using built-in default", exc_info=True)
+    return policy
+
+
+_ACP_VALIDATION_POLICY = _load_acp_validation_policy()
+_ACP_BLOCKLIST_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p) for p in _ACP_VALIDATION_POLICY["blocklisted_content_patterns"]
+)
+_ACP_ALLOWED_TOOL_KINDS: frozenset[str] = frozenset(_ACP_VALIDATION_POLICY["allowed_tool_kinds"])
+
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation import (
         ConversationCallbackType,
@@ -1271,6 +1325,10 @@ class _OpenHandsACPBridge:
                 "content": _serialize_tool_content(update.content),
             }
             self._mask_tool_call_entry(entry)
+            # MT-PA-001: validate the ACP-supplied tool call against the policy
+            # whitelist before it is surfaced/converted — a malicious ACP
+            # response must not steer tool-call construction directly.
+            self._validate_acp_tool_call(entry)
             self.accumulated_tool_calls.append(entry)
             logger.debug("ACP tool call start: %s", update.tool_call_id)
             # Emit one early "started" event — the action half of the
@@ -1327,6 +1385,36 @@ class _OpenHandsACPBridge:
             self._maybe_signal_activity()
         else:
             logger.debug("ACP session update: %s", type(update).__name__)
+
+    def _validate_acp_tool_call(self, entry: dict[str, Any]) -> None:
+        """Validate an ACP-supplied tool-call entry against the validation policy
+        before it is surfaced or converted to a tool invocation (MT-PA-001).
+
+        A malicious or compromised ACP server can return tool calls that steer
+        construction directly. Reject a disallowed ``tool_kind`` or blocklisted
+        argument content by marking the entry failed and redacting its
+        ``raw_input`` in place, rather than passing it through to downstream
+        tools / the reasoning loop.
+        """
+        kind = entry.get("tool_kind")
+        raw_input = entry.get("raw_input")
+        serialized = "" if raw_input is None else json.dumps(raw_input, default=str)
+        violation: str | None = None
+        if kind is not None and kind not in _ACP_ALLOWED_TOOL_KINDS:
+            violation = f"disallowed tool kind {kind!r}"
+        else:
+            for pattern in _ACP_BLOCKLIST_RES:
+                if pattern.search(serialized):
+                    violation = f"blocklisted argument pattern {pattern.pattern!r}"
+                    break
+        if violation:
+            logger.warning(
+                "ACP tool call %s failed validation (%s); neutralizing before emission",
+                entry.get("tool_call_id"),
+                violation,
+            )
+            entry["status"] = "failed"
+            entry["raw_input"] = "[withheld: failed tool-call validation]"
 
     def _emit_tool_call_event(self, tc: dict[str, Any]) -> None:
         """Emit an ACPToolCallEvent reflecting the current state of ``tc``.
@@ -3042,18 +3130,12 @@ class ACPAgent(AgentBase):
     # Exfiltration signatures checked on external ACP response text (MT-PA-001).
     # Conservative, structural patterns — credentials embedded in URLs, common
     # token/key shapes — not a content classifier.
-    _ACP_EXFIL_PATTERNS = (
-        re.compile(r"https?://[^\s/]*:[^\s/@]+@"),  # credentials in URL authority
-        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),  # GitHub token shapes
-        re.compile(r"\b(?:sk|rk)-[A-Za-z0-9]{20,}\b"),  # API secret-key shapes
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
-        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),  # private key blocks
-    )
-
     def _validate_acp_response_text(self, response_text: str) -> str:
-        """Return ``response_text`` unless it carries exfiltration signatures, in
-        which case log the attempt and return a safe placeholder (MT-PA-001)."""
-        for pattern in self._ACP_EXFIL_PATTERNS:
+        """Return ``response_text`` unless it carries exfiltration signatures from
+        the validation policy's blocklist, in which case log the attempt and
+        return a safe placeholder (MT-PA-001). Shares the policy blocklist with
+        the tool-call path so both are enforced consistently."""
+        for pattern in _ACP_BLOCKLIST_RES:
             if pattern.search(response_text):
                 logger.warning(
                     "ACP response text matched an exfiltration pattern (%s); "
