@@ -86,6 +86,10 @@ from openhands.sdk.tool.builtins import (
     FinishTool,
     ThinkAction,
 )
+from openhands.sdk.tool.sanitizer import (
+    is_sanitization_enabled,
+    sanitize_tool_call,
+)
 
 
 logger = get_logger(__name__)
@@ -1188,15 +1192,32 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 "as it was checked earlier."
             )
 
+        # MT-PA-001: Sanitize LLM-generated tool arguments before dispatch to
+        # neutralize prompt-injection payloads, regardless of the model's
+        # intent. This runs on every tool call at the framework level.
+        action = action_event.action
+        if is_sanitization_enabled(action_event.tool_name):
+            action, sanitization_report = sanitize_tool_call(action)
+            if sanitization_report:
+                # Audit evidence: record which fields/rules fired so repeated
+                # manipulation attempts are detectable.
+                logger.warning(
+                    "Tool-input sanitization neutralized suspected prompt-"
+                    "injection patterns in tool '%s' (call_id=%s): %s",
+                    action_event.tool_name,
+                    action_event.tool_call.id,
+                    sanitization_report,
+                )
+
         # Execute actions!
         try:
             if should_enable_observability():
                 tool_name = extract_action_name(action_event)
                 observation: Observation = observe(name=tool_name, span_type="TOOL")(
                     tool
-                )(action_event.action, conversation)
+                )(action, conversation)
             else:
-                observation = tool(action_event.action, conversation)
+                observation = tool(action, conversation)
             assert isinstance(observation, Observation), (
                 f"Tool '{tool.name}' executor must return an Observation"
             )

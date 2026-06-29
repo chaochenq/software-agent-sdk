@@ -5,7 +5,7 @@ import platform
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 if TYPE_CHECKING:
@@ -112,6 +112,40 @@ class TerminalAction(Action):
         default=False,
         description="If True, reset the terminal by creating a new session. Use this only when the terminal becomes unresponsive. Note that all previously set environment variables and session state will be lost after reset. Cannot be used with is_input=True.",  # noqa
     )
+
+    @model_validator(mode="after")
+    def _reject_control_character_injection(self) -> "TerminalAction":
+        """Reject control-character payloads in the command (MT-PA-001).
+
+        Note: the terminal tool legitimately runs shell commands containing
+        metacharacters (``|``, ``&``, ``;``, ``..`` etc.), so we deliberately
+        do NOT blanket-reject those — doing so would break the tool. Instead we
+        reject genuine injection indicators that never appear in a legitimate
+        agent-issued command: NUL bytes and raw C0 control characters (other
+        than tab / newline / carriage-return, which are valid in heredocs).
+        These are classic terminal-injection / argument-smuggling vectors.
+
+        SECURITY NOTE: this validator does not (and cannot) prevent the LLM
+        from constructing a malicious-but-well-formed command. That threat is
+        addressed by other layers: MT-PA-001 (argument sanitization),
+        MT-PA-009 (clean file/web content before it enters context), MT-PA-014
+        (validate model outputs), and MT-PA-005 (human confirmation for
+        privileged actions).
+        """
+        # ``is_input=True`` forwards raw keystrokes to an already-running
+        # interactive process, where control bytes (e.g. ESC, arrow keys) are
+        # legitimate. The injection threat here is malicious *commands*, so the
+        # check only applies to command execution.
+        if self.is_input:
+            return self
+        for ch in self.command:
+            code = ord(ch)
+            if code == 0 or (code < 0x20 and ch not in ("\t", "\n", "\r")):
+                raise ValueError(
+                    "Command contains a disallowed control character "
+                    f"(0x{code:02x}); possible injection payload."
+                )
+        return self
 
     @property
     def visualize(self) -> Text:
