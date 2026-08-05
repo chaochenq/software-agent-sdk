@@ -64,14 +64,14 @@ jobs:
             issue_number: ${{ steps.resolve-issue.outputs.issue_number }}
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
                   ref: ${{ github.event.pull_request.head.sha || github.ref }}
                   persist-credentials: false
 
             - name: Checkout evaluation model config
-              uses: actions/checkout@v6
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   repository: OpenHands/evaluation
                   ref: main
@@ -82,7 +82,7 @@ jobs:
                   persist-credentials: false
 
             - name: Set up Python
-              uses: actions/setup-python@v5
+              uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
               with:
                   python-version: '3.13'
 
@@ -251,7 +251,7 @@ jobs:
                 job-config: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   # For pull_request_target: checkout fork PR code (requires explicit repository)
                   # For other events: fallback to current repository and ref
@@ -267,7 +267,7 @@ jobs:
                   python-version: ${{ matrix.python-version }}
 
             - name: Install Node.js
-              uses: actions/setup-node@v6
+              uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
               with:
                   node-version: '22'
 
@@ -362,7 +362,7 @@ jobs:
                   tar -czvf ../../../integration_tests_${{ matrix.job-config['run-suffix'] }}_${TIMESTAMP}.tar.gz *${{ matrix.job-config['run-suffix'] }}* # Include result directories for this model
 
             - name: Upload evaluation results as artifact
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               id: upload_results_artifact
               with:
                   name: integration-test-outputs-${{ matrix.job-config['run-suffix'] }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -383,7 +383,7 @@ jobs:
                   fi
 
             - name: Upload test results summary
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: test-results-${{ matrix.job-config['run-suffix'] }}
                   path: test_results_summary/${{ matrix.job-config['run-suffix'] }}_results.json
@@ -408,7 +408,7 @@ jobs:
             issues: write
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               with:
                   # When using pull_request_target, explicitly checkout the PR branch
                   # This ensures we use the scripts from the actual PR code
@@ -425,14 +425,14 @@ jobs:
                   uv sync --dev
 
             - name: Download all test results
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: test-results-*
                   merge-multiple: true
                   path: all_results
 
             - name: Download all integration test artifacts
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: integration-test-outputs-*
                   path: artifacts
@@ -458,7 +458,7 @@ jobs:
                     --output-file consolidated_report.md
 
             - name: Upload consolidated report
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: consolidated-report
                   path: consolidated_report.md

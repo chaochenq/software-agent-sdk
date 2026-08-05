@@ -37,7 +37,7 @@ jobs:
             # Use PAT so the push triggers CI workflows that will complete and
             # satisfy branch protection. We can't use [skip ci] because the Vercel
             # GitHub App creates stuck checks that block merging.
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
               if: steps.check-fork.outputs.is_fork == 'false'
               with:
                   ref: ${{ github.event.pull_request.head.ref }}
@@ -65,7 +65,7 @@ jobs:
 
             - name: Update PR comment after cleanup
               if: steps.check-fork.outputs.is_fork == 'false' && steps.remove.outputs.removed == 'true'
-              uses: actions/github-script@v9
+              uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
               with:
                   script: |
                       const marker = '<!-- pr-artifacts-notice -->';
@@ -99,7 +99,7 @@ jobs:
             contents: read
             pull-requests: write
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
             - name: Check for .pr/ directory
               id: check
@@ -113,7 +113,7 @@ jobs:
 
             - name: Post or update PR comment
               if: steps.check.outputs.exists == 'true'
-              uses: actions/github-script@v9
+              uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
               with:
                   script: |
                       const marker = '<!-- pr-artifacts-notice -->';
