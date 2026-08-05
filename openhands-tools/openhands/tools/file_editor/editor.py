@@ -621,13 +621,41 @@ class FileEditor:
             new_content=new_file_text,
         )
 
+    def _validate_within_workspace(self, path: Path) -> None:
+        """Reject a path that resolves outside the workspace root.
+
+        `workspace_root` previously only seeded the working directory, so it
+        described where the agent starts rather than where it is confined: an
+        absolute path or a `..` traversal reached anything the process could
+        read, including /etc, credential stores and SSH keys.
+
+        Resolution happens before the comparison so a symlink pointing out of
+        the workspace is judged by its real target, not its location. A
+        workspace root that is itself a symlink is resolved the same way, so a
+        legitimate path is never rejected merely because the root was reached
+        through a link.
+        """
+        if self._cwd is None:
+            return
+        root = Path(self._cwd).resolve()
+        # strict=False: `create` targets a file that does not exist yet, and the
+        # traversal still has to be judged.
+        resolved = path.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise EditorToolParameterInvalidError(
+                "path",
+                str(path),
+                f"Path outside workspace. Files must be under {root}.",
+            )
+
     def validate_path(self, command: CommandLiteral, path: Path) -> None:
         """
         Check that the path/command combination is valid.
 
         Validates:
         1. Path is absolute
-        2. Path and command are compatible
+        2. Path resolves inside the workspace root
+        3. Path and command are compatible
         """
         # Check if it's an absolute path on the current host filesystem.
         if not is_host_absolute_path(path):
@@ -644,6 +672,8 @@ class FileEditor:
                 str(path),
                 suggestion_message,
             )
+
+        self._validate_within_workspace(path)
 
         # Check if path and command are compatible
         if command == "create" and path.exists():
