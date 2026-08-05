@@ -2,6 +2,7 @@ import asyncio
 import glob
 import json
 import os
+import shlex
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -215,15 +216,31 @@ class BashEventService:
     async def _execute_bash_command(self, command: BashCommand) -> None:
         """Execute the bash event and create an observation event."""
         try:
-            # Create subprocess in a new session so we can signal the whole
-            # process group on teardown (the shell's children, e.g. sleep, must
-            # die before the shell can run user-installed traps).
-            process = await asyncio.create_subprocess_shell(
-                command.command,
+            # The command string reaches us from the agent, so anything an
+            # untrusted instruction can talk the model into is executed here.
+            # Under `shell=True` a single `;` or `$(...)` turns one approved
+            # command into arbitrary code, so parse into argv and run the binary
+            # directly — no shell to interpret metacharacters.
+            #
+            # Commands that genuinely need shell syntax must ask for a shell
+            # explicitly (`bash -lc '...'`), which keeps the decision visible in
+            # the command itself instead of applying to everything by default.
+            try:
+                argv = shlex.split(command.command)
+            except ValueError as exc:
+                # Unbalanced quoting: the shell would have parsed this
+                # differently than we just did, so refusing beats guessing.
+                raise ValueError(f"command could not be parsed: {exc}") from None
+            if not argv:
+                raise ValueError("command is empty after parsing")
+
+            # start_new_session so teardown can signal the whole process group
+            # (children such as `sleep` must die before the parent exits).
+            process = await asyncio.create_subprocess_exec(
+                *argv,
                 cwd=command.cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                shell=True,
                 env=sanitized_env(),
                 start_new_session=True,
             )
