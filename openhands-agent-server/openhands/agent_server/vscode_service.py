@@ -145,29 +145,30 @@ class VSCodeService:
 
     async def _start_vscode_process(self) -> None:
         """Start the VSCode server process."""
-        extensions_arg = (
-            f"--extensions-dir {self.extensions_dir} "
-            if self.extensions_dir.exists()
-            else ""
-        )
-        base_path_arg = (
-            f"--server-base-path {self.server_base_path} "
-            if self.server_base_path
-            else ""
-        )
-        cmd = (
-            f"exec {self.openvscode_server_root}/bin/openvscode-server "
-            f"--host 0.0.0.0 "
-            f"--connection-token {self.connection_token} "
-            f"--port {self.port} "
-            f"{extensions_arg}"
-            f"{base_path_arg}"
-            f"--disable-workspace-trust\n"
-        )
+        # Build argv rather than a shell string. Every interpolated value here —
+        # the server root, extensions dir, base path, token and port — came from
+        # configuration or generated state, and any one of them containing a
+        # shell metacharacter turned this into arbitrary command execution under
+        # `create_subprocess_shell`. Passing a list removes the shell entirely,
+        # so those values are argument data and can never be syntax.
+        argv = [
+            f"{self.openvscode_server_root}/bin/openvscode-server",
+            "--host",
+            "0.0.0.0",
+            "--connection-token",
+            str(self.connection_token),
+            "--port",
+            str(self.port),
+        ]
+        if self.extensions_dir.exists():
+            argv += ["--extensions-dir", str(self.extensions_dir)]
+        if self.server_base_path:
+            argv += ["--server-base-path", str(self.server_base_path)]
+        argv.append("--disable-workspace-trust")
 
         # Start the process
-        self.process = await asyncio.create_subprocess_shell(
-            cmd,
+        self.process = await asyncio.create_subprocess_exec(
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=sanitized_env(),
