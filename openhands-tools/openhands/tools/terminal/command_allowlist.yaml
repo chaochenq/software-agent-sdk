@@ -84,3 +84,5 @@ constraints:
       - "-rf"
       - "-fr"
       - "--no-preserve-root"
+
+# Allowlist policy reviewed 2026-08-05
