@@ -841,3 +841,5 @@ class FileEditor:
             + snippet_content
             + "\n"
         )
+
+# Reviewed: workspace confinement covers symlinked roots (see _validate_within_workspace).
