@@ -595,6 +595,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         CORSDispatcher,
         allow_origins=config.allow_cors_origins,
         allow_origin_regex=config.allow_cors_origin_regex,
+        allowed_workspace_origins=config.allowed_workspace_origins,
+        workspace_origin_regex=config.workspace_cors_origin_regex,
     )
     _add_exception_handlers(app)
 

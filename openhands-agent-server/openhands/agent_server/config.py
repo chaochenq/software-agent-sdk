@@ -132,8 +132,26 @@ class Config(BaseModel):
         description=(
             "CORS origins permitted by this server. Localhost / 127.0.0.1 "
             "and ``DOCKER_HOST_ADDR`` are always allowed. Does not apply to "
-            "the workspace cookie routes, which accept any origin — see "
-            "``middleware.py``."
+            "the workspace cookie routes, which have their own "
+            "``allowed_workspace_origins`` / ``workspace_cors_origin_regex`` "
+            "settings — see ``middleware.py``."
+        ),
+    )
+    allowed_workspace_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "CORS origins permitted on the workspace cookie routes. These routes "
+            "send credentials, so an origin listed here can read a victim's "
+            "workspace files, conversations and credentials from their ambient "
+            "session. Empty (the default) accepts no cross-origin request."
+        ),
+    )
+    workspace_cors_origin_regex: str | None = Field(
+        default=None,
+        description=(
+            "Regular expression matching additional workspace-cookie-route CORS "
+            "origins. Anchor it — an unanchored pattern matches any origin that "
+            "merely contains the intended one."
         ),
     )
     allow_cors_origin_regex: str | None = Field(

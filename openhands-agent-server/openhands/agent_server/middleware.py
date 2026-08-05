@@ -4,9 +4,11 @@
 based on path:
 
 * Workspace cookie endpoints (``/api/auth/workspace-session`` and
-  ``/api/conversations/{id}/workspace/*``) — wildcard CORS that echoes
-  the request Origin on every response. These are the only routes that
-  authenticate via an ambient (cookie) credential.
+  ``/api/conversations/{id}/workspace/*``) — credentialed CORS restricted
+  to ``allowed_workspace_origins`` / ``workspace_cors_origin_regex``, and
+  denying cross-origin requests when neither is set. These are the only
+  routes that authenticate via an ambient (cookie) credential, so a
+  permissive origin here is readable by any page the victim visits.
 * Everything else — ``LocalhostCORSMiddleware``, which honors the
   operator's ``allow_cors_origins`` / ``allow_cors_origin_regex`` and always
   allows localhost and ``DOCKER_HOST_ADDR`` (matches OpenHands/OpenHands#4624
@@ -63,17 +65,25 @@ class LocalhostCORSMiddleware(CORSMiddleware):
 class CORSDispatcher:
     """Dispatches each request to the workspace or default CORS middleware.
 
-    The workspace branch uses ``allow_origin_regex=r"https?://.+"`` rather
-    than ``allow_origins=["*"]`` for two reasons:
+    The workspace branch is configured from ``allowed_workspace_origins`` /
+    ``workspace_cors_origin_regex`` and denies cross-origin requests by
+    default. These routes send credentials, so any origin allowed here can
+    read a victim's workspace files, conversations and credentials from
+    their ambient session.
+
+    It deliberately still uses an explicit origin list / regex rather than
+    ``allow_origins=["*"]``, for two reasons that outlive the wildcard:
 
     1. Starlette emits a literal ``*`` on simple responses when
        ``allow_all_origins`` is set and the request has no ``Cookie``
        header — which browsers reject together with
-       ``Access-Control-Allow-Credentials: true``. The regex path always
+       ``Access-Control-Allow-Credentials: true``. The explicit path always
        echoes the request Origin (with ``Vary: Origin``).
-    2. Anchoring to ``http(s)://`` excludes ``Origin: null`` (sandboxed
-       iframes, ``data:`` / ``blob:`` URLs), which have no defined CHIPS
-       partition key and are not legitimate clients.
+    2. Requiring an ``http(s)://`` origin excludes ``Origin: null``
+       (sandboxed iframes, ``data:`` / ``blob:`` URLs), which have no
+       defined CHIPS partition key and are not legitimate clients. Anchor
+       any regex you configure — an unanchored pattern matches every origin
+       that merely contains the intended one.
     """
 
     def __init__(
@@ -82,15 +92,28 @@ class CORSDispatcher:
         *,
         allow_origins: list[str],
         allow_origin_regex: str | None = None,
+        allowed_workspace_origins: list[str] | None = None,
+        workspace_origin_regex: str | None = None,
     ) -> None:
         self._default_cors = LocalhostCORSMiddleware(
             app,
             allow_origins=list(allow_origins),
             allow_origin_regex=allow_origin_regex,
         )
+        # The workspace cookie routes send credentials, so a permissive origin
+        # here lets any page a victim visits read their workspace files,
+        # conversations and credentials from the ambient session. The previous
+        # r"https?://.+" matched every origin on either scheme, which is
+        # indistinguishable from allow_origins=["*"] with credentials enabled —
+        # a combination browsers refuse precisely because it is unsafe.
+        #
+        # Deny by default: with nothing configured, no cross-origin request is
+        # accepted on these routes and same-origin use is unaffected.
+        workspace_origins = list(allowed_workspace_origins or [])
         self._workspace_cors = CORSMiddleware(
             app,
-            allow_origin_regex=r"https?://.+",
+            allow_origins=workspace_origins,
+            allow_origin_regex=workspace_origin_regex,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
