@@ -13,6 +13,7 @@ from openhands.sdk.tool import ToolExecutor
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
+from openhands.tools.terminal.command_allowlist import enforce
 from openhands.tools.terminal.constants import CMD_OUTPUT_PS1_END
 from openhands.tools.terminal.definition import (
     _LITERAL_ARG_HINT_TEMPLATE,
@@ -562,6 +563,21 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                         literal_kind=literal_kind,
                         head=head,
                     ),
+                    is_error=True,
+                    command=action.command,
+                    exit_code=None,
+                )
+
+        # Allowlist gate (MT-PA-006). Deny-by-default: the base binary must be
+        # approved and the command free of shell metacharacters and
+        # substitution before it reaches a session. Skipped when
+        # `is_input=True`, which forwards keystrokes to an already-running
+        # process rather than starting a new command.
+        if not action.is_input:
+            rejection = enforce(action.command)
+            if rejection is not None:
+                return TerminalObservation.from_text(
+                    rejection.as_message(),
                     is_error=True,
                     command=action.command,
                     exit_code=None,

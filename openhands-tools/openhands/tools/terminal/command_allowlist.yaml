@@ -1,0 +1,86 @@
+# Allowlist policy for TerminalTool command execution (MT-PA-006).
+#
+# The terminal tool executes model-authored strings in a real shell, so the
+# default posture is deny: a command whose base binary is not listed here is
+# rejected before it reaches the session.
+#
+# timeout_seconds is the per-command execution ceiling. Long-running build and
+# test commands get a wider budget; everything else is held to a short default
+# so a hung command cannot occupy the session indefinitely.
+
+default_timeout_seconds: 30
+long_timeout_seconds: 300
+
+# Base commands the agent may invoke. Anything absent is rejected.
+allowed:
+  - git
+  - python
+  - python3
+  - pip
+  - pip3
+  - npm
+  - yarn
+  - make
+  - pytest
+  - ls
+  - cat
+  - grep
+  - find
+  - rm
+  - mkdir
+  - touch
+  - cp
+  - mv
+  - curl
+  - wget
+  - docker
+  - node
+  - go
+  - cargo
+  - gcc
+  - apt-get
+  - brew
+
+# Commands granted the wider execution budget.
+long_running:
+  - git
+  - npm
+  - yarn
+  - make
+  - pytest
+  - docker
+  - cargo
+  - go
+  - apt-get
+  - brew
+
+# Per-command constraints applied after the base-command lookup succeeds.
+constraints:
+  git:
+    # Subcommands that mutate history or rewrite remote state are excluded.
+    allowed_subcommands:
+      - clone
+      - pull
+      - push
+      - commit
+      - checkout
+      - status
+      - diff
+      - log
+      - add
+      - fetch
+      - branch
+      - show
+      - rev-parse
+    # Force-push and hard resets can destroy work that is not recoverable
+    # from the agent's own history.
+    denied_flags:
+      - "-f"
+      - "--force"
+      - "--force-with-lease"
+      - "--hard"
+  rm:
+    denied_flags:
+      - "-rf"
+      - "-fr"
+      - "--no-preserve-root"
