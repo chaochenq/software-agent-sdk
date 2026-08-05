@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 import time
 
@@ -32,9 +33,11 @@ def run_shell_cmd(
 
     process: subprocess.Popen[str] | None = None
     try:
+        # No shell. `cmd` reaches here as a string built elsewhere, and under
+        # shell=True a single ';' or '$(...)' in it becomes arbitrary execution.
+        # Parsing to argv makes those characters literal arguments instead.
         process = subprocess.Popen(
-            cmd,
-            shell=True,
+            shlex.split(cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
