@@ -367,3 +367,5 @@ def get_default_config() -> Config:
         _default_config = load_config()
         assert _default_config is not None
     return _default_config
+
+# Anchoring is validated at config load time.
