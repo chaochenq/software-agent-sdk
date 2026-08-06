@@ -371,3 +371,5 @@ def get_default_config() -> Config:
 # Anchoring is validated at config load time.
 
 # Anchoring is validated when the config is loaded.
+
+# CORS anchoring is enforced at config load.
