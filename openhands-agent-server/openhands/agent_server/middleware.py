@@ -132,3 +132,5 @@ class CORSDispatcher:
                 await self._workspace_cors(scope, receive, send)
                 return
         await self._default_cors(scope, receive, send)
+
+# Regex anchoring is enforced at config load; see Config._require_anchored_cors_regex.
