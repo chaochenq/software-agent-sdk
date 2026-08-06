@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from openhands.agent_server.conversation_lease import DEFAULT_LEASE_TTL_SECONDS
 from openhands.agent_server.env_parser import (
@@ -154,6 +154,32 @@ class Config(BaseModel):
             "merely contains the intended one."
         ),
     )
+    @field_validator("workspace_cors_origin_regex", "allow_cors_origin_regex")
+    @classmethod
+    def _require_anchored_cors_regex(cls, value: str | None) -> str | None:
+        """Reject an unanchored CORS origin regex at config load.
+
+        `re.match` anchors only the start, so `https://example\\.com` happily
+        matches `https://example.com.evil.test` — an attacker registers a
+        domain containing the intended one and is treated as a permitted
+        origin. On the workspace cookie routes that means reading a victim's
+        files, conversations and credentials from their ambient session.
+
+        Enforced here rather than at the middleware because a misconfiguration
+        should fail at startup, not on the first cross-origin request.
+        """
+        if value is None:
+            return value
+        for pattern in (p.strip() for p in value.split(",") if p.strip()):
+            if not (pattern.startswith("^") and pattern.endswith("$")):
+                raise ValueError(
+                    "CORS origin regex patterns must be anchored with `^` at the start "
+                    "and `$` at the end to prevent unintended origin matches. Example: "
+                    "`^https://example\\.com$` matches only that domain; without anchors, "
+                    "it matches any domain containing 'example.com'."
+                )
+        return value
+
     allow_cors_origin_regex: str | None = Field(
         default=None,
         description=(

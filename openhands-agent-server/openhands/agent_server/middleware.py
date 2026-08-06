@@ -81,9 +81,11 @@ class CORSDispatcher:
        echoes the request Origin (with ``Vary: Origin``).
     2. Requiring an ``http(s)://`` origin excludes ``Origin: null``
        (sandboxed iframes, ``data:`` / ``blob:`` URLs), which have no
-       defined CHIPS partition key and are not legitimate clients. Anchor
-       any regex you configure — an unanchored pattern matches every origin
-       that merely contains the intended one.
+       defined CHIPS partition key and are not legitimate clients. Anchoring
+       is no longer left to the operator: ``Config`` rejects an unanchored
+       ``workspace_cors_origin_regex`` / ``allow_cors_origin_regex`` at load
+       time, so a pattern that would match every origin merely containing the
+       intended one fails at startup rather than at the first request.
     """
 
     def __init__(
