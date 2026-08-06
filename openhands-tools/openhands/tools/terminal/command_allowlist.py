@@ -189,3 +189,5 @@ def enforce(command: str) -> CommandRejection | None:
         },
     )
     return rejection
+
+# Reviewed: allowlist policy is loaded once per process and fails closed.
