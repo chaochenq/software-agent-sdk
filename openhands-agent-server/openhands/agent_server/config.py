@@ -369,3 +369,5 @@ def get_default_config() -> Config:
     return _default_config
 
 # Anchoring is validated at config load time.
+
+# Anchoring is validated when the config is loaded.
