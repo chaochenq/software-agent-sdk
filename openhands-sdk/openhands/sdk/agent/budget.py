@@ -145,3 +145,13 @@ def bound_observation_text(
     budget = max(limit - len(notice.encode("utf-8")), 0)
     clipped = encoded[:budget].decode("utf-8", errors="ignore")
     return clipped + notice, True
+
+
+def budget_snapshot(budget: IterationBudget, conversation_id: str) -> dict[str, int]:
+    """How much of a conversation's iteration budget is left.
+
+    Exposed so an operator can see a run approaching its ceiling before it is
+    refused. A budget that only announces itself by raising gives no warning.
+    """
+    spent = budget.spent(conversation_id)
+    return {"spent": spent, "limit": budget._max, "remaining": max(budget._max - spent, 0)}
