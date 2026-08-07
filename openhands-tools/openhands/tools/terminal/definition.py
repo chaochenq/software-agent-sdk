@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 
 if TYPE_CHECKING:
+    from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
 from rich.text import Text
 
@@ -32,6 +33,10 @@ from openhands.tools.terminal.descriptions import (
     WINDOWS_TOOL_DESCRIPTION,
 )
 from openhands.tools.terminal.metadata import CmdOutputMetadata
+from openhands.tools.utils.workspace_scope import (
+    ToolExecutionError,
+    screen_command_for_traversal,
+)
 
 
 _LITERAL_ARG_HINT_TEMPLATE = (
@@ -312,6 +317,32 @@ class TerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
         if getattr(self.executor, "is_pooled", False):
             return DeclaredResources(keys=(), declared=True)
         return DeclaredResources(keys=("terminal:session",), declared=True)
+
+    def __call__(
+        self,
+        action: TerminalAction,
+        conversation: "LocalConversation | None" = None,
+    ) -> Observation:
+        """Screen the command for workspace escape, then run it (MT-PA-003).
+
+        Unlike the file tools there is no `path` argument to canonicalise — the
+        target is buried in a shell string — so this is a heuristic screen for
+        the obvious attempt, not a boundary. Keystroke input (`is_input`) is
+        exempt: it is fed to an already-running process, not parsed as a
+        command, and `C-c` or a filename typed at a prompt would otherwise trip
+        the patterns.
+        """
+        working_dir = getattr(self.executor, "working_dir", None)
+        if not working_dir:
+            raise ToolExecutionError(
+                f"{self.name}: no workspace root is configured; refusing to run "
+                f"commands unscoped."
+            )
+        if not action.is_input and action.command:
+            screen_command_for_traversal(
+                action.command, working_dir, tool_name=self.name
+            )
+        return super().__call__(action, conversation)
 
     @classmethod
     def create(

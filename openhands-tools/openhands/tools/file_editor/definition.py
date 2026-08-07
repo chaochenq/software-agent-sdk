@@ -8,6 +8,7 @@ from pydantic import Field, PrivateAttr
 
 
 if TYPE_CHECKING:
+    from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
 
 from rich.text import Text
@@ -21,6 +22,10 @@ from openhands.sdk.tool import (
     register_tool,
 )
 from openhands.tools.file_editor.utils.diff import visualize_diff
+from openhands.tools.utils.workspace_scope import (
+    ToolExecutionError,
+    resolve_within_workspace,
+)
 
 
 CommandLiteral = Literal["view", "create", "str_replace", "insert", "undo_edit"]
@@ -204,6 +209,36 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
         assert isinstance(action, FileEditorAction)
         normalized_path = Path(action.path).resolve()
         return DeclaredResources(keys=(f"file:{normalized_path}",), declared=True)
+
+    def __call__(
+        self,
+        action: FileEditorAction,
+        conversation: "LocalConversation | None" = None,
+    ) -> Observation:
+        """Scope the requested path to the workspace, then edit (MT-PA-003).
+
+        The check runs here, before ``super().__call__`` reaches the executor
+        and the executor reaches the filesystem, so a path that escapes the
+        workspace never opens a file — not even for ``view``, which is the
+        command an exfiltration prompt actually wants.
+        """
+        workspace_root = getattr(self.executor, "workspace_root", None)
+        if not workspace_root:
+            # Deny by default. Skipping the check when the root is unknown
+            # would mean an executor that forgot to declare one silently gets
+            # unrestricted filesystem access — the precise failure this control
+            # exists to prevent.
+            raise ToolExecutionError(
+                f"{self.name}: no workspace root is configured; refusing to "
+                f"access the filesystem unscoped."
+            )
+        resolve_within_workspace(
+            action.path,
+            workspace_root,
+            tool_name=self.name,
+            parameter="path",
+        )
+        return super().__call__(action, conversation)
 
     @classmethod
     def create(

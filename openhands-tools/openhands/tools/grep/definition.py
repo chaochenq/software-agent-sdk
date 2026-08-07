@@ -16,7 +16,14 @@ from openhands.sdk.tool import (
 )
 
 
+from openhands.tools.utils.workspace_scope import (
+    ToolExecutionError,
+    resolve_within_workspace,
+)
+
+
 if TYPE_CHECKING:
+    from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
 
 
@@ -77,6 +84,34 @@ class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
         if not isinstance(action, GrepAction):
             raise TypeError(f"Expected GrepAction, got {type(action).__name__}")
         return DeclaredResources(keys=(), declared=True)
+
+    def __call__(
+        self,
+        action: GrepAction,
+        conversation: "LocalConversation | None" = None,
+    ) -> Observation:
+        """Scope the search root to the workspace, then search (MT-PA-003).
+
+        Grep is read-only, which makes it the *most* attractive of the three to
+        an exfiltration prompt rather than the least: pointed at `/etc` or a home
+        directory it returns matching paths and lines directly into the
+        conversation. A `None` search path falls back to the executor's own
+        working directory, which is in scope by construction.
+        """
+        working_dir = getattr(self.executor, "working_dir", None)
+        if not working_dir:
+            raise ToolExecutionError(
+                f"{self.name}: no workspace root is configured; refusing to "
+                f"search unscoped."
+            )
+        if action.path is not None:
+            resolve_within_workspace(
+                action.path,
+                working_dir,
+                tool_name=self.name,
+                parameter="path",
+            )
+        return super().__call__(action, conversation)
 
     @classmethod
     def create(

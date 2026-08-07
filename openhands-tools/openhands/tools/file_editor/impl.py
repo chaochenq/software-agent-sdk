@@ -28,6 +28,11 @@ class FileEditorExecutor(ToolExecutor):
         allowed_edits_files: list[str] | None = None,
     ):
         self.editor: FileEditor = FileEditor(workspace_root=workspace_root)
+        # Recorded so the tool boundary can scope incoming paths to the
+        # workspace before any file I/O runs (MT-PA-003). The editor derives
+        # the same value, but reaching into its private `_cwd` from the tool
+        # would couple the check to an implementation detail.
+        self.workspace_root: str = self.editor._cwd
         self.allowed_edits_files: set[Path] | None = (
             {Path(f).resolve() for f in allowed_edits_files}
             if allowed_edits_files
