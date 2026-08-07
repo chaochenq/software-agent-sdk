@@ -24,6 +24,7 @@ conversation id keeps one conversation's spend from exhausting another's.
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 
 
@@ -32,6 +33,12 @@ from collections import OrderedDict
 # point is that the default is finite.
 DEFAULT_MAX_ITERATIONS = 100
 DEFAULT_MAX_TOOL_CALLS_PER_STEP = 10
+
+# Wall-clock ceiling per conversation. An iteration cap alone does not bound a
+# run: a single step that blocks on a slow tool, or steps that each take minutes,
+# stay under the count and still burn unbounded time and money. The two limits
+# catch different runaway shapes and neither substitutes for the other.
+DEFAULT_MAX_ELAPSED_SECONDS = 3600
 
 # The counter map is itself a resource. A long-lived process serving many
 # conversations would grow it without bound — an unbounded budget of exactly the
@@ -64,9 +71,12 @@ class IterationBudget:
         self,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_tracked_conversations: int = MAX_TRACKED_CONVERSATIONS,
+        max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
     ) -> None:
         self._max = max_iterations
         self._max_tracked = max_tracked_conversations
+        self._max_elapsed = max_elapsed_seconds
+        self._started_at: dict[str, float] = {}
         # Insertion-ordered, so evicting the oldest entry is a `popitem` on the
         # front rather than a scan.
         self._counts: OrderedDict[str, int] = OrderedDict()
@@ -78,6 +88,14 @@ class IterationBudget:
         Returns the new count so callers can log progress toward the limit.
         """
         with self._lock:
+            now = time.monotonic()
+            started = self._started_at.setdefault(conversation_id, now)
+            elapsed = now - started
+            if elapsed > self._max_elapsed:
+                raise ResourceExhaustionError(
+                    f"Conversation exceeded its wall-clock budget of "
+                    f"{self._max_elapsed:.0f}s (elapsed {elapsed:.0f}s)."
+                )
             count = self._counts.get(conversation_id, 0) + 1
             if count > self._max:
                 raise ResourceExhaustionError(
@@ -92,7 +110,8 @@ class IterationBudget:
                 # denying it, which is the safer direction to fail: the limit is
                 # a runaway guard, not a quota to be enforced at the cost of
                 # killing legitimate work.
-                self._counts.popitem(last=False)
+                evicted, _ = self._counts.popitem(last=False)
+                self._started_at.pop(evicted, None)
             return count
 
     def spent(self, conversation_id: str) -> int:
@@ -107,6 +126,7 @@ class IterationBudget:
         """
         with self._lock:
             self._counts.pop(conversation_id, None)
+            self._started_at.pop(conversation_id, None)
 
 
 def enforce_tool_call_limit(
