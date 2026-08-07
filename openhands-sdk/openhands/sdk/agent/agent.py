@@ -11,6 +11,11 @@ from pydantic import PrivateAttr, ValidationError, model_validator
 import openhands.sdk.security.analyzer as analyzer
 import openhands.sdk.security.risk as risk
 from openhands.sdk.agent.base import AgentBase
+from openhands.sdk.agent.budget import (
+    DEFAULT_MAX_OBSERVATION_BYTES,
+    IterationBudget,
+    bound_observation_text,
+)
 from openhands.sdk.agent.critic_mixin import CriticMixin
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.agent.response_dispatch import (
@@ -51,6 +56,7 @@ from openhands.sdk.event.condenser import (
     CondensationRequest,
 )
 from openhands.sdk.llm import (
+    ImageContent,
     LLMResponse,
     Message,
     MessageToolCall,
@@ -332,11 +338,33 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         default_factory=ParallelToolExecutor
     )
 
+    # Keyed by conversation id: one Agent instance may serve several
+    # conversations, and one conversation's spend must not exhaust another's.
+    _iteration_budget: IterationBudget = PrivateAttr(
+        default_factory=lambda: IterationBudget()
+    )
+
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
         self._parallel_executor = ParallelToolExecutor(
             max_workers=self.tool_concurrency_limit
         )
+        self._iteration_budget = IterationBudget(max_iterations=self.max_iterations)
+
+    def _charge_iteration(self, state: ConversationState) -> None:
+        """Spend one step from this conversation's budget.
+
+        Raises ResourceExhaustionError when the budget is gone. Charging happens
+        before the LLM call, not after: a step that is refused must not first pay
+        for a completion.
+        """
+        spent = self._iteration_budget.charge(str(state.id))
+        if spent == self.max_iterations:
+            logger.warning(
+                "Conversation %s reached its final permitted iteration (%d).",
+                state.id,
+                self.max_iterations,
+            )
 
     @model_validator(mode="before")
     @classmethod
@@ -551,6 +579,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         on_token: ConversationTokenCallbackType | None = None,
     ) -> None:
         state = conversation.state
+        self._charge_iteration(state)
         # Check for pending actions (implicit confirmation)
         # and execute them before sampling new actions.
         pending_actions = ConversationState.get_unmatched_actions(state.events)
@@ -717,6 +746,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         loop responsive during blocking tool I/O.
         """
         state = conversation.state
+        self._charge_iteration(state)
         # Check for pending actions (implicit confirmation)
         pending_actions = ConversationState.get_unmatched_actions(state.events)
         if pending_actions:
@@ -1233,6 +1263,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             )
             return [error_event]
 
+        observation = self._bound_observation_size(observation, tool.name)
+
         obs_event = ObservationEvent(
             observation=observation,
             action_id=action_event.id,
@@ -1240,6 +1272,50 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             tool_call_id=action_event.tool_call.id,
         )
         return [obs_event]
+
+    def _bound_observation_size(
+        self, observation: Observation, tool_name: str
+    ) -> Observation:
+        """Clamp a tool result to the per-observation byte budget (MT-002).
+
+        Applied before the observation becomes an event, because that is the
+        point at which it is committed to the conversation and every subsequent
+        request carries it. A tool that reads a large file would otherwise be
+        the cheapest way to blow the context window and evict the system prompt.
+
+        Only text is bounded; image content is sized by the tool that produced
+        it and truncating its bytes would corrupt it rather than shrink it.
+        """
+        remaining = DEFAULT_MAX_OBSERVATION_BYTES
+        bounded: list[TextContent | ImageContent] = []
+        truncated = False
+
+        for item in observation.content:
+            if not isinstance(item, TextContent):
+                bounded.append(item)
+                continue
+            if remaining <= 0:
+                # Budget already spent by earlier items. Dropping the rest keeps
+                # the total bounded; appending a per-item truncation notice would
+                # let a many-part observation exceed the budget through the
+                # notices alone.
+                truncated = True
+                continue
+            text, was_truncated = bound_observation_text(item.text, limit=remaining)
+            truncated = truncated or was_truncated
+            remaining = max(remaining - len(text.encode("utf-8")), 0)
+            bounded.append(TextContent(text=text))
+
+        if not truncated:
+            return observation
+
+        logger.warning(
+            "Observation from tool '%s' exceeded the %d-byte budget and was "
+            "truncated.",
+            tool_name,
+            DEFAULT_MAX_OBSERVATION_BYTES,
+        )
+        return observation.model_copy(update={"content": bounded})
 
     def _maybe_emit_vllm_tokens(
         self, llm_response: LLMResponse, on_event: ConversationCallbackType

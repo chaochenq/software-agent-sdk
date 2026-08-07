@@ -11,6 +11,10 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from openhands.sdk.agent.budget import (
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    enforce_tool_call_limit,
+)
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import LLMResponse, Message, TextContent
@@ -203,6 +207,16 @@ class ResponseDispatchMixin:
 
         action_events: list[ActionEvent] = []
         assert message.tool_calls, "classify_response guarantees tool_calls"
+        # Bound the fan-out from one LLM turn before any of it is dispatched
+        # (MT-002). Checked here rather than inside the loop so nothing runs at
+        # all when the response is over budget — a partial dispatch would leave
+        # side effects behind for a response that was refused.
+        enforce_tool_call_limit(
+            len(message.tool_calls),
+            limit=getattr(
+                self, "max_tool_calls_per_step", DEFAULT_MAX_TOOL_CALLS_PER_STEP
+            ),
+        )
         for i, tool_call in enumerate(message.tool_calls):
             action_event = self._get_action_event(
                 tool_call,
@@ -253,6 +267,16 @@ class ResponseDispatchMixin:
 
         action_events: list[ActionEvent] = []
         assert message.tool_calls, "classify_response guarantees tool_calls"
+        # Bound the fan-out from one LLM turn before any of it is dispatched
+        # (MT-002). Checked here rather than inside the loop so nothing runs at
+        # all when the response is over budget — a partial dispatch would leave
+        # side effects behind for a response that was refused.
+        enforce_tool_call_limit(
+            len(message.tool_calls),
+            limit=getattr(
+                self, "max_tool_calls_per_step", DEFAULT_MAX_TOOL_CALLS_PER_STEP
+            ),
+        )
         for i, tool_call in enumerate(message.tool_calls):
             action_event = self._get_action_event(
                 tool_call,

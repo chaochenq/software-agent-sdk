@@ -24,6 +24,10 @@ from pydantic import (
     model_validator,
 )
 
+from openhands.sdk.agent.budget import (
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+)
 from openhands.sdk.context.agent_context import AgentContext
 from openhands.sdk.context.condenser import CondenserBase
 from openhands.sdk.context.prompts.presets import create_registry
@@ -430,6 +434,28 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             "May impact performance, especially in 'all_actions' mode."
         ),
         examples=[{"kind": "AgentFinishedCritic"}],
+    )
+
+    max_iterations: int = Field(
+        default=DEFAULT_MAX_ITERATIONS,
+        ge=1,
+        description=(
+            "Maximum number of agent steps a single conversation may take. The "
+            "loop is driven by LLM output, which is shaped by conversation "
+            "content that is often untrusted, so an unbounded loop is a cost and "
+            "availability risk. Exceeding this raises ResourceExhaustionError."
+        ),
+    )
+
+    max_tool_calls_per_step: int = Field(
+        default=DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+        ge=1,
+        description=(
+            "Maximum number of tool calls accepted from a single LLM response. "
+            "Bounds the fan-out from one turn into many subprocesses. A response "
+            "above this limit is refused rather than truncated, so the model is "
+            "never left believing work happened that did not."
+        ),
     )
 
     tool_concurrency_limit: int = Field(
