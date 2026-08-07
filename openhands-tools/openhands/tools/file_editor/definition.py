@@ -232,13 +232,20 @@ class FileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
                 f"{self.name}: no workspace root is configured; refusing to "
                 f"access the filesystem unscoped."
             )
-        resolve_within_workspace(
+        resolved = resolve_within_workspace(
             action.path,
             workspace_root,
             tool_name=self.name,
             parameter="path",
         )
-        return super().__call__(action, conversation)
+        # Hand the executor the canonical path, not the string that was
+        # checked. Re-resolving downstream would reopen the gap the check just
+        # closed: a symlink swapped between this check and the executor's open
+        # would be followed, because the executor would resolve the original
+        # path a second time and get a different answer.
+        return super().__call__(
+            action.model_copy(update={"path": str(resolved)}), conversation
+        )
 
     @classmethod
     def create(

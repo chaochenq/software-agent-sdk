@@ -24,6 +24,7 @@ conversation id keeps one conversation's spend from exhausting another's.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 
 
 # Chosen to sit well above any legitimate task while still bounding a runaway
@@ -31,6 +32,13 @@ import threading
 # point is that the default is finite.
 DEFAULT_MAX_ITERATIONS = 100
 DEFAULT_MAX_TOOL_CALLS_PER_STEP = 10
+
+# The counter map is itself a resource. A long-lived process serving many
+# conversations would grow it without bound — an unbounded budget of exactly the
+# kind this module exists to prevent. Callers release a finished conversation,
+# but relying on every finish path remembering to do so is how leaks happen, so
+# the map also evicts its oldest entry past this many tracked conversations.
+MAX_TRACKED_CONVERSATIONS = 10_000
 
 # Bytes, applied to a single observation's rendered text.
 DEFAULT_MAX_OBSERVATION_BYTES = 10 * 1024
@@ -52,9 +60,16 @@ class IterationBudget:
     a lost increment here is a lost enforcement.
     """
 
-    def __init__(self, max_iterations: int = DEFAULT_MAX_ITERATIONS) -> None:
+    def __init__(
+        self,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        max_tracked_conversations: int = MAX_TRACKED_CONVERSATIONS,
+    ) -> None:
         self._max = max_iterations
-        self._counts: dict[str, int] = {}
+        self._max_tracked = max_tracked_conversations
+        # Insertion-ordered, so evicting the oldest entry is a `popitem` on the
+        # front rather than a scan.
+        self._counts: OrderedDict[str, int] = OrderedDict()
         self._lock = threading.Lock()
 
     def charge(self, conversation_id: str) -> int:
@@ -71,6 +86,13 @@ class IterationBudget:
                     f"needs more."
                 )
             self._counts[conversation_id] = count
+            self._counts.move_to_end(conversation_id)
+            while len(self._counts) > self._max_tracked:
+                # Evicting an active conversation resets its budget rather than
+                # denying it, which is the safer direction to fail: the limit is
+                # a runaway guard, not a quota to be enforced at the cost of
+                # killing legitimate work.
+                self._counts.popitem(last=False)
             return count
 
     def spent(self, conversation_id: str) -> int:

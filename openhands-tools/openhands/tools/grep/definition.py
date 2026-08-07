@@ -105,12 +105,16 @@ class GrepTool(ToolDefinition[GrepAction, GrepObservation]):
                 f"search unscoped."
             )
         if action.path is not None:
-            resolve_within_workspace(
+            resolved = resolve_within_workspace(
                 action.path,
                 working_dir,
                 tool_name=self.name,
                 parameter="path",
             )
+            # Search the canonical path. Passing the original through would let
+            # the executor resolve it again, and a symlink swapped in between
+            # would be followed on that second resolution.
+            action = action.model_copy(update={"path": str(resolved)})
         return super().__call__(action, conversation)
 
     @classmethod

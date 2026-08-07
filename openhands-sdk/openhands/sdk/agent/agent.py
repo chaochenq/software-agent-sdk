@@ -351,6 +351,16 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         )
         self._iteration_budget = IterationBudget(max_iterations=self.max_iterations)
 
+    def _mark_finished(self, state: ConversationState) -> None:
+        """Close out a conversation: mark it FINISHED and free its budget.
+
+        Releasing here rather than leaving the counter behind keeps the budget
+        map proportional to *live* conversations instead of to every conversation
+        the process has ever served.
+        """
+        state.execution_status = ConversationExecutionStatus.FINISHED
+        self._iteration_budget.release(str(state.id))
+
     def _charge_iteration(self, state: ConversationState) -> None:
         """Spend one step from this conversation's budget.
 
@@ -530,11 +540,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             check_iterative_refinement=lambda ae: (
                 self._check_iterative_refinement(conversation, ae)
             ),
-            mark_finished=lambda: setattr(
-                state,
-                "execution_status",
-                ConversationExecutionStatus.FINISHED,
-            ),
+            mark_finished=lambda: self._mark_finished(state),
         )
 
     async def _aexecute_actions(
@@ -564,11 +570,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             check_iterative_refinement=lambda ae: (
                 self._check_iterative_refinement(conversation, ae)
             ),
-            mark_finished=lambda: setattr(
-                state,
-                "execution_status",
-                ConversationExecutionStatus.FINISHED,
-            ),
+            mark_finished=lambda: self._mark_finished(state),
         )
 
     @observe(name="agent.step", ignore_inputs=["state", "on_event"])
