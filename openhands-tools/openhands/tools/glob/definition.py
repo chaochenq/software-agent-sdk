@@ -92,6 +92,14 @@ class GlobTool(ToolDefinition[GlobAction, GlobObservation]):
                 f"{self.name}: no workspace root is configured; refusing to "
                 f"search unscoped."
             )
+        # A pattern is as capable of escaping as a path: `**/../../etc/*` walks
+        # out of the workspace even when `path` is in scope, because the glob is
+        # expanded relative to the root rather than confined to it.
+        if ".." in (action.pattern or ""):
+            raise ToolExecutionError(
+                f"{self.name}: 'pattern' contains a parent-directory traversal. "
+                f"Search patterns are confined to the workspace."
+            )
         if action.path is not None:
             resolved = resolve_within_workspace(
                 action.path,
