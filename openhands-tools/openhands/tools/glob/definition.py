@@ -16,7 +16,14 @@ from openhands.sdk.tool import (
 )
 
 
+from openhands.tools.utils.workspace_scope import (
+    ToolExecutionError,
+    resolve_within_workspace,
+)
+
+
 if TYPE_CHECKING:
+    from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
 
 
@@ -64,6 +71,36 @@ Examples:
 
 class GlobTool(ToolDefinition[GlobAction, GlobObservation]):
     """A ToolDefinition subclass that automatically initializes a GlobExecutor."""
+
+    def __call__(
+        self,
+        action: GlobAction,
+        conversation: "LocalConversation | None" = None,
+    ) -> Observation:
+        """Scope the search root to the workspace, then glob (MT-PA-003).
+
+        Glob was the one file tool left unscoped when the others were confined.
+        It returns paths rather than contents, which reads as harmless and is not:
+        an unscoped glob enumerates a home directory or `/etc` and hands the
+        listing straight back to the model, which is reconnaissance for whichever
+        read the attacker asks for next. A `None` path falls back to the
+        executor's own working directory, which is in scope by construction.
+        """
+        working_dir = getattr(self.executor, "working_dir", None)
+        if not working_dir:
+            raise ToolExecutionError(
+                f"{self.name}: no workspace root is configured; refusing to "
+                f"search unscoped."
+            )
+        if action.path is not None:
+            resolved = resolve_within_workspace(
+                action.path,
+                working_dir,
+                tool_name=self.name,
+                parameter="path",
+            )
+            action = action.model_copy(update={"path": str(resolved)})
+        return super().__call__(action, conversation)
 
     def declared_resources(self, action: Action) -> DeclaredResources:
         """Declare resource usage based on the active backend.
