@@ -7,11 +7,6 @@ on:
     pull_request:
         branches: [main]
 
-# Least-privilege default: these workflows only read the repository.
-# Any job needing more must opt in explicitly at the job level.
-permissions:
-  contents: read
-
 jobs:
     sdk-api:
         name: Python API
